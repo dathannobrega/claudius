@@ -24,7 +24,10 @@ static const char *MESSAGE_NAMES[] = {
     "CHAT",
     "GAME_PREPARE",
     "GAME_LOAD_COMPLETE",
-    "GAME_START_FINAL"
+    "GAME_START_FINAL",
+    "SAVE_TRANSFER_BEGIN",
+    "SAVE_TRANSFER_CHUNK",
+    "SAVE_TRANSFER_COMPLETE"
 };
 
 int net_protocol_validate_header(const net_packet_header *header)

@@ -8,7 +8,8 @@
 typedef enum {
     MP_OWNER_AI = 0,
     MP_OWNER_LOCAL_PLAYER = 1,
-    MP_OWNER_REMOTE_PLAYER = 2
+    MP_OWNER_REMOTE_PLAYER = 2,
+    MP_OWNER_RESERVED = 3          /* Reserved for late joiners */
 } mp_owner_type;
 
 typedef enum {

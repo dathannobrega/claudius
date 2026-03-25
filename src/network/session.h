@@ -91,7 +91,7 @@ const net_peer *net_session_get_peer(int index);
 const net_peer *net_session_get_host_peer(void);
 
 /* Game control (host only) */
-int net_session_start_game(void);
+int net_session_transition_to_game(void);
 void net_session_set_game_speed(uint8_t speed);
 void net_session_set_paused(int paused);
 void net_session_advance_tick(void);

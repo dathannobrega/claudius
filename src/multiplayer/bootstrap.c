@@ -8,6 +8,8 @@
 #include "trade_execution.h"
 #include "scenario_selection.h"
 #include "mp_debug_log.h"
+#include "mp_safe_file.h"
+#include "save_transfer.h"
 #include "player_registry.h"
 #include "ownership.h"
 #include "empire_sync.h"
@@ -19,14 +21,17 @@
 #include "session_save.h"
 #include "trade_sync.h"
 #include "worldgen.h"
+#include "join_transaction.h"
 #include "network/session.h"
 #include "network/serialize.h"
 #include "network/protocol.h"
+#include "network/transport_tcp.h"
 #include "network/discovery_lan.h"
 #include "scenario/empire.h"
 #include "empire/city.h"
 #include "game/file.h"
 #include "game/state.h"
+#include "platform/file_manager.h"
 #include "core/log.h"
 #include "core/string.h"
 #include "window/city.h"
@@ -47,6 +52,7 @@ void mp_bootstrap_init(void)
 {
     memset(&boot_data, 0, sizeof(boot_data));
     mp_game_manifest_init();
+    mp_join_transaction_init();
 }
 
 void mp_bootstrap_reset(void)
@@ -225,6 +231,12 @@ int mp_bootstrap_host_start_game(void)
                          scenario_hash, scenario_hash, 0, seed, NET_MAX_PLAYERS);
     mp_game_manifest_set_player_count((uint8_t)player_count);
 
+    /* Generate unique world instance UUID for this session */
+    {
+        mp_game_manifest *m = mp_game_manifest_get_mutable();
+        mp_player_registry_generate_uuid(m->world_instance_uuid);
+    }
+
     /* Store seed in spawn table for worldgen */
     mp_worldgen_get_spawn_table_mutable()->session_seed = seed;
 
@@ -271,6 +283,15 @@ int mp_bootstrap_host_start_game(void)
     }
     mp_worldgen_lock();
 
+    /* 4b. Generate reserved spawns for late joiners */
+    {
+        int max_late = MP_MAX_PLAYERS - player_count;
+        if (max_late > 0) {
+            int reserve = max_late > 4 ? 4 : max_late;
+            mp_worldgen_generate_reserved_spawns(reserve);
+        }
+    }
+
     /* 5. Bind multiplayer subsystems to the loaded scenario */
     mp_bootstrap_bind_loaded_scenario();
 
@@ -278,7 +299,7 @@ int mp_bootstrap_host_start_game(void)
     mp_worldgen_apply_spawns();
 
     /* 7. Transition session to in-game state (sets peers to IN_GAME) */
-    net_session_start_game();
+    net_session_transition_to_game();
 
     /* 8. Broadcast spawn table to clients (must be AFTER start_game
      *    because broadcast only sends to PEER_STATE_IN_GAME peers) */
@@ -336,27 +357,24 @@ int mp_bootstrap_client_prepare(const uint8_t *payload, uint32_t size)
 
     /* Check if this is a resume from save */
     if (manifest->mode == MP_GAME_MODE_SAVED_GAME) {
-        MP_LOG_INFO("BOOT", "Client resume mode: waiting for host snapshot (no local save needed)");
+        MP_LOG_INFO("BOOT", "Client resume mode: waiting for save transfer from host");
         strncpy(boot_data.save_filename, manifest->scenario_name,
                 MP_MANIFEST_SCENARIO_NAME_MAX - 1);
         boot_data.is_resume = 1;
-        boot_data.state = MP_BOOT_PREPARING;
+        boot_data.state = MP_BOOT_SAVE_TRANSFER;
 
-        /* CLIENT DOES NOT LOAD SAVE LOCALLY.
-         * In the new architecture, the client receives all state from the host
-         * via snapshot. This eliminates the dependency on having the .sav file
-         * on the client machine.
-         *
-         * Instead, we just enable multiplayer mode and wait for the snapshot
-         * and GAME_START_FINAL from host. */
+        /* Initialize save transfer to receive the full save file.
+         * The host will send the complete save (base game state + MP state)
+         * in chunks. The client will write it to a temp file and load it
+         * using the standard game_file_load_saved_game() path. */
+        mp_save_transfer_init();
         scenario_empire_set_multiplayer_mode(1);
 
-        /* Initialize minimal stateless subsystems for receiving snapshot */
+        /* Initialize minimal stateless subsystems for post-load */
         mp_checksum_init();
         mp_resync_init();
 
-        boot_data.state = MP_BOOT_LOADED;
-        MP_LOG_INFO("BOOT", "Client prepared for resume: waiting for snapshot from host");
+        MP_LOG_INFO("BOOT", "Client prepared for resume: waiting for save transfer");
         return 1;
     }
 
@@ -562,6 +580,45 @@ int mp_bootstrap_host_resume_game(void)
     return 1;
 }
 
+static void mp_bootstrap_host_finalize_resume(void)
+{
+    /* Send FULL_SNAPSHOT as a "freshness layer" — overwrites MP domain state
+     * with the latest authoritative values (which may differ from the save
+     * if time elapsed between save checkpoint and launch). */
+    {
+        uint8_t *snap_buf = (uint8_t *)malloc(MP_SNAPSHOT_MAX_SIZE);
+        if (snap_buf) {
+            uint32_t snap_size = 0;
+            if (mp_snapshot_build_full(snap_buf, MP_SNAPSHOT_MAX_SIZE, &snap_size)) {
+                net_session_broadcast(NET_MSG_FULL_SNAPSHOT, snap_buf, snap_size);
+                MP_LOG_INFO("BOOT", "Resume snapshot broadcast: %u bytes", snap_size);
+            }
+            free(snap_buf);
+        }
+    }
+
+    /* Send GAME_START_FINAL with restored authoritative tick */
+    {
+        uint8_t start_buf[8];
+        net_serializer ss;
+        net_serializer_init(&ss, start_buf, sizeof(start_buf));
+        net_write_u32(&ss, mp_time_sync_get_authoritative_tick());
+        net_write_u8(&ss, mp_time_sync_get_speed());
+        net_session_broadcast(NET_MSG_GAME_START_FINAL, start_buf,
+                              (uint32_t)net_serializer_position(&ss));
+    }
+
+    /* Stop LAN discovery */
+    net_discovery_stop_announcing();
+
+    /* Transition to gameplay */
+    boot_data.state = MP_BOOT_IN_GAME;
+    window_city_show();
+
+    MP_LOG_INFO("BOOT", "=== Resumed game launched successfully (tick=%u) ===",
+                mp_time_sync_get_authoritative_tick());
+}
+
 int mp_bootstrap_host_launch_resumed_game(void)
 {
     if (!net_session_is_host()) {
@@ -582,7 +639,7 @@ int mp_bootstrap_host_launch_resumed_game(void)
     }
 
     /* 2. Transition session to in-game state */
-    net_session_start_game();
+    net_session_transition_to_game();
 
     /* 3. Build manifest with saved game mode */
     mp_game_manifest_set(MP_GAME_MODE_SAVED_GAME, boot_data.save_filename,
@@ -604,42 +661,288 @@ int mp_bootstrap_host_launch_resumed_game(void)
         }
     }
 
-    /* 5. Send full snapshot so clients get current MP state.
-     *    This is the authoritative snapshot that clients use to reconstruct
-     *    their entire game state. Clients do NOT load a save file locally. */
+    /* 5. Create save checkpoint and start chunked transfer to clients.
+     *    This replaces the old snapshot-only approach: clients now receive
+     *    the full save file so they have base game state (buildings, figures,
+     *    terrain, map grids) — not just MP domain state. */
+    {
+        const char *checkpoint_path = mp_safe_file_get_save_path("mp_resume_checkpoint.sav");
+        if (!game_file_write_saved_game(checkpoint_path)) {
+            MP_LOG_ERROR("BOOT", "Failed to write save checkpoint — falling back to snapshot-only");
+            /* Fall through to finalize without save transfer */
+            mp_bootstrap_host_finalize_resume();
+            return 1;
+        }
+
+        mp_save_transfer_init();
+        if (!mp_save_transfer_host_begin(checkpoint_path)) {
+            MP_LOG_ERROR("BOOT", "Failed to start save transfer — falling back to snapshot-only");
+            platform_file_manager_remove_file(checkpoint_path);
+            mp_bootstrap_host_finalize_resume();
+            return 1;
+        }
+
+        /* Clean up checkpoint file — data is now in memory */
+        platform_file_manager_remove_file(checkpoint_path);
+    }
+
+    /* 6. Set state to SAVE_TRANSFER — transfer continues in mp_bootstrap_update() */
+    boot_data.state = MP_BOOT_SAVE_TRANSFER;
+
+    MP_LOG_INFO("BOOT", "Save transfer started — driving from mp_bootstrap_update()");
+    return 1;
+}
+
+void mp_bootstrap_update(void)
+{
+    if (boot_data.state == MP_BOOT_SAVE_TRANSFER && net_session_is_host()) {
+        if (mp_save_transfer_host_update()) {
+            return; /* Still sending chunks */
+        }
+        /* Transfer complete — finalize the resume */
+        mp_bootstrap_host_finalize_resume();
+    }
+}
+
+void mp_bootstrap_client_save_transfer_complete(void)
+{
+    MP_LOG_INFO("BOOT", "Client save transfer complete — loading save from buffer");
+
+    uint32_t save_size = 0;
+    const uint8_t *save_data = mp_save_transfer_client_get_data(&save_size);
+
+    if (!save_data || save_size == 0) {
+        MP_LOG_ERROR("BOOT", "No save data after transfer");
+        return;
+    }
+
+    /* Write to temp file */
+    const char *temp_path = mp_safe_file_get_save_path("mp_resume_received.sav");
+    if (!mp_safe_file_write(temp_path, NULL, save_data, save_size)) {
+        MP_LOG_ERROR("BOOT", "Failed to write temp save file: %s", temp_path);
+        return;
+    }
+
+    /* Load using standard path — identical code path as host */
+    int load_result = game_file_load_saved_game(temp_path);
+    if (load_result != 1) {
+        MP_LOG_ERROR("BOOT", "Failed to load transferred save (result=%d)", load_result);
+        platform_file_manager_remove_file(temp_path);
+        return;
+    }
+
+    /* Rebind MP subsystems from loaded save */
+    mp_bootstrap_rebind_loaded_save();
+    boot_data.state = MP_BOOT_LOADED;
+
+    /* Cleanup temp file */
+    platform_file_manager_remove_file(temp_path);
+
+    /* Free the transfer buffer */
+    mp_save_transfer_reset();
+
+    MP_LOG_INFO("BOOT", "Client save loaded successfully — waiting for snapshot + GAME_START_FINAL");
+}
+
+/* ---- Phase 6: Late join handler ---- */
+
+void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_name)
+{
+    if (!net_session_is_host()) {
+        return;
+    }
+
+    extern int mp_worldgen_get_reserved_count(void);
+    if (mp_worldgen_get_reserved_count() <= 0) {
+        MP_LOG_ERROR("BOOT", "No reserved slots for late join");
+        /* Reject will be handled by caller */
+        return;
+    }
+
+    /* 1. Activate join barrier — pauses simulation for all players */
+    mp_time_sync_set_join_barrier(1);
+
+    /* Broadcast barrier active event */
+    {
+        uint8_t event_buf[16];
+        net_serializer es;
+        net_serializer_init(&es, event_buf, sizeof(event_buf));
+        net_write_u16(&es, NET_EVENT_JOIN_BARRIER_ACTIVE);
+        net_write_u32(&es, mp_time_sync_get_authoritative_tick());
+        net_write_u8(&es, 0); /* reserved */
+        net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
+                              (uint32_t)net_serializer_position(&es));
+    }
+
+    /* 2. Begin join transaction for rollback tracking */
+    extern mp_join_transaction *mp_join_transaction_begin(uint8_t peer_index);
+    mp_join_transaction *txn = mp_join_transaction_begin(peer_index);
+    if (!txn) {
+        MP_LOG_ERROR("BOOT", "Failed to create join transaction");
+        mp_time_sync_set_join_barrier(0);
+        return;
+    }
+
+    /* 3. Register player in registry */
+    uint8_t new_player_id = 0;
+    for (int i = 1; i < MP_MAX_PLAYERS; i++) {
+        mp_player *p = mp_player_registry_get((uint8_t)i);
+        if (!p || !p->active) {
+            new_player_id = (uint8_t)i;
+            break;
+        }
+    }
+    if (new_player_id == 0) {
+        MP_LOG_ERROR("BOOT", "No free player ID for late join");
+        mp_join_transaction_rollback(txn);
+        return;
+    }
+
+    mp_player_registry_add(new_player_id, player_name, 0, 0);
+    txn->registry_created = 1;
+    txn->player_id = new_player_id;
+
+    int slot_id = mp_player_registry_assign_slot(new_player_id);
+    txn->slot_id = (uint8_t)slot_id;
+
+    /* 4. Assign reserved spawn */
+    int city_id = mp_worldgen_assign_reserved_spawn((uint8_t)slot_id);
+    if (city_id < 0) {
+        MP_LOG_ERROR("BOOT", "No reserved city available for late join");
+        mp_join_transaction_rollback(txn);
+        return;
+    }
+    txn->assigned_city_id = city_id;
+
+    /* 5. Set ownership */
+    mp_ownership_set_city(city_id, MP_OWNER_REMOTE_PLAYER, new_player_id);
+    mp_ownership_set_city_online(city_id, 1);
+    txn->ownership_created = 1;
+
+    mp_player_registry_set_city(new_player_id, city_id);
+    mp_player_registry_set_assigned_city(new_player_id, city_id);
+
+    /* 6. Register in empire sync */
+    {
+        const mp_spawn_entry *spawn = mp_worldgen_get_spawn_for_slot((uint8_t)slot_id);
+        int obj_id = spawn ? spawn->empire_object_id : -1;
+        if (obj_id >= 0) {
+            mp_empire_sync_register_player_city(city_id, new_player_id, obj_id);
+            txn->empire_sync_registered = 1;
+        }
+    }
+
+    /* 7. Configure peer */
+    {
+        net_peer *peer = (net_peer *)net_session_get_peer(peer_index);
+        if (peer) {
+            /* We need a non-const peer for modification — get via session */
+            net_session *sess = net_session_get();
+            net_peer *mutable_peer = &sess->peers[peer_index];
+
+            strncpy(mutable_peer->name, player_name, NET_MAX_PLAYER_NAME - 1);
+            mutable_peer->name[NET_MAX_PLAYER_NAME - 1] = '\0';
+            net_peer_set_player_id(mutable_peer, new_player_id);
+            mutable_peer->state = PEER_STATE_LOADING;
+
+            mp_player_registry_set_status(new_player_id, MP_PLAYER_IN_GAME);
+            mp_player_registry_set_connection_state(new_player_id, MP_CONNECTION_CONNECTED);
+        }
+    }
+
+    /* 8. Send JOIN_ACCEPT */
+    {
+        mp_player *player = mp_player_registry_get(new_player_id);
+        uint8_t accept_buf[128];
+        net_serializer as;
+        net_serializer_init(&as, accept_buf, sizeof(accept_buf));
+        net_write_u8(&as, new_player_id);
+        net_write_u8(&as, (uint8_t)slot_id);
+        net_write_u32(&as, net_session_get()->session_id);
+        net_write_u32(&as, mp_worldgen_get_spawn_table()->session_seed);
+        net_write_u8(&as, (uint8_t)mp_player_registry_get_count());
+        if (player) {
+            net_write_raw(&as, player->player_uuid, MP_PLAYER_UUID_SIZE);
+            net_write_raw(&as, player->reconnect_token, MP_RECONNECT_TOKEN_SIZE);
+        } else {
+            uint8_t zeros[16] = {0};
+            net_write_raw(&as, zeros, 16);
+            net_write_raw(&as, zeros, 16);
+        }
+        net_session_send_to_peer(peer_index, NET_MSG_JOIN_ACCEPT,
+                                 accept_buf, (uint32_t)net_serializer_position(&as));
+    }
+
+    /* 9. Send GAME_PREPARE + save transfer + snapshot + GAME_START_FINAL */
+    {
+        /* Send manifest */
+        uint8_t manifest_buf[256];
+        uint32_t manifest_size = 0;
+        mp_game_manifest_serialize(manifest_buf, &manifest_size);
+        net_session_send_to_peer(peer_index, NET_MSG_GAME_PREPARE,
+                                 manifest_buf, manifest_size);
+    }
+
+    /* 10. Create save checkpoint and start transfer to joining peer.
+     *     For now we use broadcast which sends to all IN_GAME peers.
+     *     The joining peer is in LOADING state, so we send directly. */
+    {
+        const char *checkpoint_path = mp_safe_file_get_save_path("mp_latejoin_checkpoint.sav");
+        if (game_file_write_saved_game(checkpoint_path)) {
+            mp_save_transfer_init();
+            mp_save_transfer_host_begin(checkpoint_path);
+            platform_file_manager_remove_file(checkpoint_path);
+
+            /* Drive the transfer to completion synchronously for late join.
+             * This blocks for a short time but ensures atomic delivery. */
+            while (mp_save_transfer_host_update()) {
+                /* Continue sending chunks */
+            }
+        }
+    }
+
+    /* 11. Send snapshot with latest MP state */
     {
         uint8_t *snap_buf = (uint8_t *)malloc(MP_SNAPSHOT_MAX_SIZE);
         if (snap_buf) {
             uint32_t snap_size = 0;
             if (mp_snapshot_build_full(snap_buf, MP_SNAPSHOT_MAX_SIZE, &snap_size)) {
-                net_session_broadcast(NET_MSG_FULL_SNAPSHOT, snap_buf, snap_size);
-                MP_LOG_INFO("BOOT", "Resume snapshot broadcast: %u bytes", snap_size);
+                net_session_send_to_peer(peer_index, NET_MSG_FULL_SNAPSHOT,
+                                         snap_buf, snap_size);
             }
             free(snap_buf);
         }
     }
 
-    /* 6. Send GAME_START_FINAL with restored authoritative tick */
+    /* 12. Send GAME_START_FINAL */
     {
         uint8_t start_buf[8];
         net_serializer ss;
         net_serializer_init(&ss, start_buf, sizeof(start_buf));
         net_write_u32(&ss, mp_time_sync_get_authoritative_tick());
         net_write_u8(&ss, mp_time_sync_get_speed());
-        net_session_broadcast(NET_MSG_GAME_START_FINAL, start_buf,
-                              (uint32_t)net_serializer_position(&ss));
+        net_session_send_to_peer(peer_index, NET_MSG_GAME_START_FINAL,
+                                 start_buf, (uint32_t)net_serializer_position(&ss));
     }
 
-    /* 7. Stop LAN discovery */
-    net_discovery_stop_announcing();
+    /* Broadcast player joined event */
+    {
+        uint8_t event_buf[32];
+        net_serializer es;
+        net_serializer_init(&es, event_buf, sizeof(event_buf));
+        net_write_u16(&es, NET_EVENT_PLAYER_JOINED);
+        net_write_u32(&es, mp_time_sync_get_authoritative_tick());
+        net_write_u8(&es, new_player_id);
+        net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
+                              (uint32_t)net_serializer_position(&es));
+    }
 
-    /* 8. Transition to gameplay */
-    boot_data.state = MP_BOOT_IN_GAME;
-    window_city_show();
+    /* Transaction start time for timeout tracking */
+    txn->start_ms = net_tcp_get_timestamp_ms();
 
-    MP_LOG_INFO("BOOT", "=== Resumed game launched successfully (tick=%u) ===",
-                mp_time_sync_get_authoritative_tick());
-    return 1;
+    MP_LOG_INFO("BOOT", "Late join initiated: player '%s' (id=%d, slot=%d, city=%d) — "
+                "waiting for GAME_LOAD_COMPLETE",
+                player_name, (int)new_player_id, slot_id, city_id);
 }
 
 #endif /* ENABLE_MULTIPLAYER */

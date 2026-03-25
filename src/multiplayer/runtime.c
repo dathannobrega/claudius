@@ -3,9 +3,11 @@
 #ifdef ENABLE_MULTIPLAYER
 
 #include "bootstrap.h"
+#include "join_transaction.h"
 #include "mp_autosave.h"
 #include "mp_debug_log.h"
 #include "network/session.h"
+#include "network/transport_tcp.h"
 #include "network/discovery_lan.h"
 #include "scenario/empire.h"
 #include "core/log.h"
@@ -72,7 +74,17 @@ void multiplayer_runtime_update(void)
      * net_discovery_update() is a no-op if its socket is not open. */
     net_discovery_update();
 
-    /* 3. Autosave timer — runs per-frame, only meaningful on host in-game.
+    /* 3. Bootstrap update — drives non-blocking save transfer on host.
+     * mp_bootstrap_update() is a no-op if not in SAVE_TRANSFER state. */
+    mp_bootstrap_update();
+
+    /* 4. Join transaction timeout check — rolls back stalled late joins.
+     * Only meaningful on host when transactions are active. */
+    if (net_session_is_host()) {
+        mp_join_transaction_check_timeouts(net_tcp_get_timestamp_ms());
+    }
+
+    /* 5. Autosave timer — runs per-frame, only meaningful on host in-game.
      * mp_autosave_update() checks all preconditions internally. */
     mp_autosave_update();
 }

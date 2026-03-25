@@ -44,6 +44,9 @@ typedef struct {
     mp_spawn_entry spawns[MP_WORLDGEN_MAX_SPAWNS];
     uint32_t generation_tick;   /* Tick when this table was generated */
     int locked;                 /* 1 after game start, no rerolls allowed */
+    /* Reserved spawns for late joiners (Phase 6) */
+    uint8_t reserved_count;
+    mp_spawn_entry reserved_spawns[MP_WORLDGEN_MAX_SPAWNS];
 } mp_spawn_table;
 
 /**
@@ -100,6 +103,31 @@ void mp_worldgen_deserialize(const uint8_t *buffer, uint32_t size);
  */
 void mp_worldgen_init(void);
 void mp_worldgen_clear(void);
+
+/**
+ * Generate extra reserved spawn positions for late joiners.
+ * Called after player spawns are generated and locked.
+ * @param reserve_count  Number of reserved slots to generate (max 4)
+ * @return Number of reserved spawns actually generated
+ */
+int mp_worldgen_generate_reserved_spawns(int reserve_count);
+
+/**
+ * Assign a reserved spawn to a late joiner.
+ * @param slot_id  The player's slot_id to assign
+ * @return empire_city_id on success, -1 if no reserved spawns available
+ */
+int mp_worldgen_assign_reserved_spawn(uint8_t slot_id);
+
+/**
+ * Return a city to the reserved pool (e.g., on failed join rollback).
+ */
+void mp_worldgen_return_to_reserved(int empire_city_id);
+
+/**
+ * Get the number of available reserved spawns.
+ */
+int mp_worldgen_get_reserved_count(void);
 
 #endif /* ENABLE_MULTIPLAYER */
 

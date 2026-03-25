@@ -37,6 +37,10 @@ uint8_t mp_time_sync_get_speed(void);
 void mp_time_sync_set_paused(int paused);
 void mp_time_sync_set_speed(uint8_t speed);
 
+/* Join barrier: pauses simulation for all players during state transfer */
+void mp_time_sync_set_join_barrier(int active);
+int mp_time_sync_is_join_barrier_active(void);
+
 /* Serialization */
 void mp_time_sync_serialize(uint8_t *buffer, uint32_t *size);
 void mp_time_sync_deserialize(const uint8_t *buffer, uint32_t size);

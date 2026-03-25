@@ -73,6 +73,7 @@ void mp_game_manifest_serialize(uint8_t *buffer, uint32_t *out_size)
     net_write_u8(&s, manifest.max_players);
     net_write_u8(&s, manifest.player_count);
     net_write_u32(&s, manifest.feature_flags);
+    net_write_raw(&s, manifest.world_instance_uuid, MP_WORLD_UUID_SIZE);
 
     *out_size = (uint32_t)net_serializer_position(&s);
 }
@@ -92,6 +93,13 @@ int mp_game_manifest_deserialize(const uint8_t *buffer, uint32_t size)
     manifest.max_players = net_read_u8(&s);
     manifest.player_count = net_read_u8(&s);
     manifest.feature_flags = net_read_u32(&s);
+
+    /* Read world_instance_uuid if present (forward compat) */
+    if (!net_serializer_has_overflow(&s) && net_serializer_remaining(&s) >= MP_WORLD_UUID_SIZE) {
+        net_read_raw(&s, manifest.world_instance_uuid, MP_WORLD_UUID_SIZE);
+    } else {
+        memset(manifest.world_instance_uuid, 0, MP_WORLD_UUID_SIZE);
+    }
 
     if (net_serializer_has_overflow(&s)) {
         MP_LOG_ERROR("GAME", "Manifest deserialize overflow: size=%u", size);

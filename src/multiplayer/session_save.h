@@ -24,15 +24,50 @@
  *   - Domain count field for forward compatibility
  *   - Compatibility flags
  *   - Stronger validation on load
+ *
+ * v5 additions:
+ *   - World instance UUID for identity persistence
+ *   - Per-domain FNV-1a checksums in domain table
+ *   - Header checksum
+ *   - Forward-compatible domain tags (unknown domains skipped by size)
+ *   - Structured error codes
  */
 
 #define MP_SAVE_MAGIC       0x4D504C59  /* "MPLY" */
-#define MP_SAVE_VERSION     4
+#define MP_SAVE_VERSION     5
 #define MP_SAVE_DOMAIN_COUNT 7
+
+#define MP_SAVE_MAX_FILE_SIZE       (512 * 1024)
+#define MP_SAVE_MAX_DOMAIN_SIZE     (128 * 1024)
+#define MP_WORLD_UUID_SIZE          16
 
 /* Compatibility flags */
 #define MP_SAVE_FLAG_HAS_P2P_ROUTES   0x0001
 #define MP_SAVE_FLAG_HAS_TRADE_SYNC   0x0002
+
+/* Domain tags for forward compatibility */
+#define MP_DOMAIN_TAG_PLAYER_REGISTRY    0x01
+#define MP_DOMAIN_TAG_OWNERSHIP          0x02
+#define MP_DOMAIN_TAG_WORLDGEN           0x03
+#define MP_DOMAIN_TAG_EMPIRE_SYNC        0x04
+#define MP_DOMAIN_TAG_TRADE_SYNC_ROUTES  0x05
+#define MP_DOMAIN_TAG_TRADE_SYNC_TRADERS 0x06
+#define MP_DOMAIN_TAG_TIME_SYNC          0x07
+
+/* Load error codes */
+#define MP_LOAD_OK                  0
+#define MP_LOAD_ERR_MAGIC          -1
+#define MP_LOAD_ERR_VERSION        -2
+#define MP_LOAD_ERR_TRUNCATED      -3
+#define MP_LOAD_ERR_CHECKSUM       -4
+#define MP_LOAD_ERR_DOMAIN_CORRUPT -5
+#define MP_LOAD_ERR_SIZE           -6
+
+typedef struct {
+    uint8_t  tag;
+    uint32_t size;
+    uint32_t checksum;  /* FNV-1a */
+} mp_domain_entry;
 
 typedef struct {
     uint32_t magic;
@@ -58,6 +93,9 @@ typedef struct {
     uint8_t  domain_count;          /* Number of domains (for forward compat) */
     uint16_t compat_flags;          /* Compatibility flags */
     uint32_t payload_checksum;      /* Simple checksum of domain payload bytes */
+    /* v5 fields */
+    uint8_t  world_instance_uuid[MP_WORLD_UUID_SIZE];
+    uint32_t header_checksum;       /* FNV-1a of all header bytes before this */
 } mp_save_header;
 
 /* Save multiplayer metadata to buffer */

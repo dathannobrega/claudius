@@ -1019,8 +1019,14 @@ static void savegame_load_from_state(savegame_state *state, savegame_version_t v
                 mp_save_header mp_header;
                 if (!mp_session_save_read_header(mp_data, mp_size, &mp_header)) {
                     log_error("Multiplayer save header validation failed — skipping MP load", 0, 0);
-                } else if (!mp_session_load_from_buffer(mp_data, mp_size)) {
-                    log_error("Multiplayer session load failed — session may be incomplete", 0, 0);
+                } else {
+                    int load_result = mp_session_load_from_buffer(mp_data, mp_size);
+                    if (load_result == 0) {
+                        log_error("Multiplayer session load failed — session may be incomplete", 0, 0);
+                    } else if (load_result < 0) {
+                        /* Structured error code from v5+ save hardening */
+                        log_error("Multiplayer session load error", 0, load_result);
+                    }
                 }
             }
         }

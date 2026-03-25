@@ -20,7 +20,7 @@ typedef enum {
     NET_MSG_JOIN_ACCEPT,
     NET_MSG_JOIN_REJECT,
     NET_MSG_READY_STATE,
-    NET_MSG_START_GAME,
+    NET_MSG_START_GAME,         /* DEPRECATED — use GAME_PREPARE + GAME_START_FINAL */
     NET_MSG_CLIENT_COMMAND,
     NET_MSG_HOST_COMMAND_ACK,
     NET_MSG_FULL_SNAPSHOT,
@@ -36,6 +36,9 @@ typedef enum {
     NET_MSG_GAME_PREPARE,       /* Host → Client: manifest with scenario info */
     NET_MSG_GAME_LOAD_COMPLETE, /* Client → Host: scenario loaded locally */
     NET_MSG_GAME_START_FINAL,   /* Host → Client: all loaded, begin gameplay */
+    NET_MSG_SAVE_TRANSFER_BEGIN,    /* Host → Client: start chunked save transfer */
+    NET_MSG_SAVE_TRANSFER_CHUNK,    /* Host → Client: save file chunk data */
+    NET_MSG_SAVE_TRANSFER_COMPLETE, /* Host → Client: all chunks sent, verify */
     NET_MSG_COUNT
 } net_message_type;
 
@@ -44,7 +47,8 @@ typedef enum {
     NET_REJECT_SESSION_FULL,
     NET_REJECT_GAME_IN_PROGRESS,
     NET_REJECT_NAME_TAKEN,
-    NET_REJECT_BANNED
+    NET_REJECT_BANNED,
+    NET_REJECT_NO_RESERVED_SLOTS  /* Late join: no reserved city slots available */
 } net_reject_reason;
 
 typedef enum {
@@ -76,6 +80,8 @@ typedef enum {
     NET_EVENT_CITY_RESOURCE_SETTING,   /* Player changed import/export/stockpile for a resource */
     NET_EVENT_STORAGE_STATE_CHANGED,   /* Player changed warehouse/granary storage state */
     NET_EVENT_STORAGE_PERMISSION_CHANGED, /* Player toggled warehouse/granary permission */
+    NET_EVENT_JOIN_BARRIER_ACTIVE,    /* Simulation paused for player join */
+    NET_EVENT_JOIN_BARRIER_RELEASED,  /* Simulation resumed after join */
     NET_EVENT_COUNT
 } net_host_event_type;
 

@@ -14,6 +14,7 @@ typedef enum {
     PEER_STATE_HELLO_SENT,
     PEER_STATE_JOINED,
     PEER_STATE_READY,
+    PEER_STATE_LOADING,        /* Receiving state transfer (join barrier active) */
     PEER_STATE_IN_GAME,
     PEER_STATE_DESYNCED,
     PEER_STATE_DISCONNECTING

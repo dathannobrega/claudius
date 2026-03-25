@@ -18,6 +18,8 @@ typedef enum {
     MP_GAME_MODE_SAVED_GAME    /* Resume from save */
 } mp_game_mode;
 
+#define MP_WORLD_UUID_SIZE 16
+
 typedef struct {
     mp_game_mode mode;
     char scenario_name[MP_MANIFEST_SCENARIO_NAME_MAX]; /* Filename without extension */
@@ -28,6 +30,7 @@ typedef struct {
     uint8_t max_players;      /* Capacity (2..8) */
     uint8_t player_count;     /* Currently joined players */
     uint32_t feature_flags;   /* Bitmask of enabled game features */
+    uint8_t world_instance_uuid[MP_WORLD_UUID_SIZE]; /* Unique world identity */
     int valid;                /* 1 if the manifest has been set */
 } mp_game_manifest;
 

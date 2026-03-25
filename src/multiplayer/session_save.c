@@ -10,6 +10,7 @@
 #include "checksum.h"
 #include "command_bus.h"
 #include "worldgen.h"
+#include "game_manifest.h"
 #include "mp_debug_log.h"
 #include "network/session.h"
 #include "network/serialize.h"
@@ -21,14 +22,29 @@
 
 #define DOMAIN_BUFFER_SIZE 32768
 
-/* v2 header wire size = 58 bytes, v3 = 62 bytes, v4 = 73 bytes */
+/* v2 header wire size = 58 bytes, v3 = 62 bytes, v4 = 73 bytes, v5 = 93 bytes */
 #define HEADER_V2_SIZE 58
 #define HEADER_V3_SIZE 62
 #define HEADER_V4_SIZE 73
+#define HEADER_V5_SIZE 93  /* v4 + 16 bytes world_uuid + 4 bytes header_checksum */
+
+/* FNV-1a 32-bit checksum */
+#define FNV_OFFSET 2166136261u
+#define FNV_PRIME  16777619u
+
+static uint32_t compute_fnv1a(const uint8_t *data, uint32_t size)
+{
+    uint32_t hash = FNV_OFFSET;
+    for (uint32_t i = 0; i < size; i++) {
+        hash ^= data[i];
+        hash *= FNV_PRIME;
+    }
+    return hash;
+}
 
 static uint32_t compute_payload_checksum(const uint8_t *data, uint32_t size)
 {
-    /* Simple additive checksum with rotation for integrity verification */
+    /* Simple additive checksum with rotation for integrity verification (v4 compat) */
     uint32_t hash = 0x12345678;
     for (uint32_t i = 0; i < size; i++) {
         hash = ((hash << 5) | (hash >> 27)) ^ data[i];
@@ -90,7 +106,32 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
                               + header.trade_sync_traders_size
                               + header.time_sync_size;
 
-    uint32_t total = HEADER_V4_SIZE + header.total_payload_size;
+    /* v5: compute per-domain FNV-1a checksums */
+    mp_domain_entry domain_table[MP_SAVE_DOMAIN_COUNT];
+    {
+        const uint8_t *bufs[] = { player_buf, ownership_buf, worldgen_buf,
+                                   empire_buf, routes_buf, traders_buf, time_buf };
+        const uint32_t sizes[] = {
+            header.player_registry_size, header.ownership_size, header.worldgen_size,
+            header.empire_sync_size, header.trade_sync_routes_size,
+            header.trade_sync_traders_size, header.time_sync_size
+        };
+        const uint8_t tags[] = {
+            MP_DOMAIN_TAG_PLAYER_REGISTRY, MP_DOMAIN_TAG_OWNERSHIP,
+            MP_DOMAIN_TAG_WORLDGEN, MP_DOMAIN_TAG_EMPIRE_SYNC,
+            MP_DOMAIN_TAG_TRADE_SYNC_ROUTES, MP_DOMAIN_TAG_TRADE_SYNC_TRADERS,
+            MP_DOMAIN_TAG_TIME_SYNC
+        };
+        for (int b = 0; b < 7; b++) {
+            domain_table[b].tag = tags[b];
+            domain_table[b].size = sizes[b];
+            domain_table[b].checksum = compute_fnv1a(bufs[b], sizes[b]);
+        }
+    }
+
+    /* v5: domain table size = 9 bytes per domain (tag + size + checksum) */
+    uint32_t domain_table_wire_size = (uint32_t)(MP_SAVE_DOMAIN_COUNT * 9);
+    uint32_t total = HEADER_V5_SIZE + domain_table_wire_size + header.total_payload_size;
 
     if (total > buffer_size) {
         log_error("Save buffer too small", 0, (int)total);
@@ -98,10 +139,9 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
         return 0;
     }
 
-    /* Compute payload checksum over all domain buffers */
+    /* Compute v4 payload checksum for backward compat */
     {
         uint32_t running = 0x12345678;
-        /* Helper: chain the checksum computation across all buffers */
         const uint8_t *bufs[] = { player_buf, ownership_buf, worldgen_buf,
                                    empire_buf, routes_buf, traders_buf, time_buf };
         const uint32_t sizes[] = {
@@ -115,6 +155,14 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
             }
         }
         header.payload_checksum = running;
+    }
+
+    /* v5: copy world instance UUID from manifest */
+    {
+        const mp_game_manifest *m = mp_game_manifest_get();
+        if (m && m->valid) {
+            memcpy(header.world_instance_uuid, m->world_instance_uuid, MP_WORLD_UUID_SIZE);
+        }
     }
 
     /* Write header */
@@ -142,6 +190,19 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
     net_write_u8(&s, header.domain_count);
     net_write_u16(&s, header.compat_flags);
     net_write_u32(&s, header.payload_checksum);
+    /* v5 fields */
+    net_write_raw(&s, header.world_instance_uuid, MP_WORLD_UUID_SIZE);
+
+    /* v5: compute header checksum over all header bytes written so far */
+    header.header_checksum = compute_fnv1a(buffer, (uint32_t)net_serializer_position(&s));
+    net_write_u32(&s, header.header_checksum);
+
+    /* v5: write domain table */
+    for (int d = 0; d < MP_SAVE_DOMAIN_COUNT; d++) {
+        net_write_u8(&s, domain_table[d].tag);
+        net_write_u32(&s, domain_table[d].size);
+        net_write_u32(&s, domain_table[d].checksum);
+    }
 
     /* Write domains in order */
     net_write_raw(&s, player_buf, header.player_registry_size);
@@ -173,7 +234,9 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
 
     /* Validate total payload fits in the buffer */
     uint32_t header_wire_size;
-    if (header.version >= 4) {
+    if (header.version >= 5) {
+        header_wire_size = HEADER_V5_SIZE;
+    } else if (header.version >= 4) {
         header_wire_size = HEADER_V4_SIZE;
     } else if (header.version >= 3) {
         header_wire_size = HEADER_V3_SIZE;
@@ -189,14 +252,63 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
                             + header.trade_sync_traders_size
                             + header.time_sync_size;
 
-    if (header_wire_size + expected_total > size) {
-        log_error("Multiplayer save: buffer too small for declared domains", 0,
-                  (int)(header_wire_size + expected_total));
+    /* v5: validate file size limits */
+    if (header.version >= 5 && expected_total > MP_SAVE_MAX_FILE_SIZE) {
+        log_error("Multiplayer save: total payload exceeds max file size", 0,
+                  (int)expected_total);
         return 0;
     }
 
+    /* v5: validate header checksum */
+    if (header.version >= 5 && header.header_checksum != 0) {
+        /* Header checksum covers bytes 0..(HEADER_V5_SIZE - 4) */
+        uint32_t actual_hdr_cksum = compute_fnv1a(buffer, HEADER_V5_SIZE - 4);
+        if (actual_hdr_cksum != header.header_checksum) {
+            log_error("Multiplayer save: header checksum mismatch", 0,
+                      (int)actual_hdr_cksum);
+            return 0;
+        }
+        MP_LOG_INFO("SESSION_SAVE", "Header checksum verified: 0x%08x", actual_hdr_cksum);
+    }
+
+    /* v5: skip domain table (9 bytes per domain) — we use positional reading below */
+    uint32_t domain_table_size = 0;
+    mp_domain_entry domain_table[MP_SAVE_DOMAIN_COUNT];
+    memset(domain_table, 0, sizeof(domain_table));
+
+    if (header.version >= 5) {
+        domain_table_size = (uint32_t)(header.domain_count * 9);
+
+        if (header_wire_size + domain_table_size + expected_total > size) {
+            log_error("Multiplayer save: buffer too small for v5 layout", 0,
+                      (int)(header_wire_size + domain_table_size + expected_total));
+            return 0;
+        }
+
+        /* Read domain table */
+        net_serializer dt;
+        net_serializer_init(&dt, (uint8_t *)buffer + header_wire_size, domain_table_size);
+        for (int d = 0; d < header.domain_count && d < MP_SAVE_DOMAIN_COUNT; d++) {
+            domain_table[d].tag = net_read_u8(&dt);
+            domain_table[d].size = net_read_u32(&dt);
+            domain_table[d].checksum = net_read_u32(&dt);
+
+            if (domain_table[d].size > MP_SAVE_MAX_DOMAIN_SIZE) {
+                log_error("Multiplayer save: domain too large", 0,
+                          (int)domain_table[d].size);
+                return 0;
+            }
+        }
+    } else {
+        if (header_wire_size + expected_total > size) {
+            log_error("Multiplayer save: buffer too small for declared domains", 0,
+                      (int)(header_wire_size + expected_total));
+            return 0;
+        }
+    }
+
     /* v4: validate payload checksum */
-    if (header.version >= 4 && header.payload_checksum != 0) {
+    if (header.version >= 4 && header.version < 5 && header.payload_checksum != 0) {
         const uint8_t *payload_start = buffer + header_wire_size;
         uint32_t actual_checksum = compute_payload_checksum(payload_start, expected_total);
         if (actual_checksum != header.payload_checksum) {
@@ -218,9 +330,9 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
 
     net_serializer s;
     net_serializer_init(&s, (uint8_t *)buffer, size);
-    s.position = header_wire_size;
+    s.position = header_wire_size + domain_table_size;
 
-    /* Read each domain with size validation */
+    /* Read each domain with size validation and v5 per-domain checksum */
     int domains_ok = 1;
 
     if (header.player_registry_size > 0) {
@@ -229,6 +341,14 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
             return 0;
         }
         const uint8_t *data = buffer + s.position;
+        /* v5: verify per-domain checksum */
+        if (header.version >= 5 && domain_table[0].checksum != 0) {
+            uint32_t actual = compute_fnv1a(data, header.player_registry_size);
+            if (actual != domain_table[0].checksum) {
+                log_error("Save: player_registry domain checksum mismatch", 0, 0);
+                return 0;
+            }
+        }
         mp_player_registry_deserialize(data, header.player_registry_size);
         s.position += header.player_registry_size;
     } else {
@@ -396,6 +516,15 @@ int mp_session_save_read_header(const uint8_t *buffer, uint32_t size, mp_save_he
         header->domain_count = MP_SAVE_DOMAIN_COUNT;
         header->compat_flags = 0;
         header->payload_checksum = 0;
+    }
+
+    /* v5: world_instance_uuid and header_checksum */
+    if (header->version >= 5 && size >= HEADER_V5_SIZE) {
+        net_read_raw(&s, header->world_instance_uuid, MP_WORLD_UUID_SIZE);
+        header->header_checksum = net_read_u32(&s);
+    } else {
+        memset(header->world_instance_uuid, 0, MP_WORLD_UUID_SIZE);
+        header->header_checksum = 0;
     }
 
     /* Validate player count is sane */

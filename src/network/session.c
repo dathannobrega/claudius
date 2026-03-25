@@ -11,6 +11,10 @@
 #include "multiplayer/empire_sync.h"
 #include "multiplayer/time_sync.h"
 #include "multiplayer/worldgen.h"
+#include "multiplayer/save_transfer.h"
+#include "multiplayer/join_transaction.h"
+#include "multiplayer/client_identity.h"
+#include "multiplayer/game_manifest.h"
 #include "multiplayer/mp_debug_log.h"
 #include "core/config.h"
 #include "core/log.h"
@@ -85,6 +89,18 @@ static void handle_peer_disconnect(int peer_index)
     net_peer *peer = &session.peers[peer_index];
     if (!peer->active) {
         return;
+    }
+
+    /* Phase 7: Check for incomplete join transaction and roll back */
+    {
+        mp_join_transaction *txn = mp_join_transaction_find_by_peer((uint8_t)peer_index);
+        if (txn && txn->active) {
+            MP_LOG_INFO("SESSION", "Peer %d disconnected during join — rolling back transaction",
+                        peer_index);
+            mp_join_transaction_rollback(txn);
+            close_peer(peer_index);
+            return;
+        }
     }
 
     uint8_t player_id = peer->player_id;
@@ -405,7 +421,29 @@ static void handle_hello(net_peer *peer, const uint8_t *payload, uint32_t size)
             return; /* Reconnect succeeded */
         }
 
-        /* No reconnect possible — reject */
+        /* Phase 6: Try late join if reserved slots available */
+        {
+            extern int mp_worldgen_get_reserved_count(void);
+            if (mp_worldgen_get_reserved_count() > 0) {
+                MP_LOG_INFO("HANDSHAKE", "Attempting late join for '%s' — %d reserved slots available",
+                            name, mp_worldgen_get_reserved_count());
+                extern void mp_bootstrap_host_handle_late_join(uint8_t peer_index,
+                    const char *player_name);
+                int peer_index = -1;
+                for (int i = 0; i < NET_MAX_PEERS; i++) {
+                    if (&session.peers[i] == peer) {
+                        peer_index = i;
+                        break;
+                    }
+                }
+                if (peer_index >= 0) {
+                    mp_bootstrap_host_handle_late_join((uint8_t)peer_index, name);
+                    return;
+                }
+            }
+        }
+
+        /* No reconnect or late join possible — reject */
         MP_LOG_WARN("HANDSHAKE", "REJECT: game in progress, no valid UUID for reconnect (name='%s')", name);
         uint8_t reject_buf[2];
         net_serializer rs;
@@ -631,6 +669,36 @@ static void handle_client_message(net_peer *peer, const net_packet_header *heade
             /* Client reports scenario loaded — track for loading barrier */
             MP_LOG_INFO("BOOT", "Peer '%s' (player %d) reports scenario loaded",
                         peer->name, (int)peer->player_id);
+
+            /* If this peer was in LOADING state (join barrier active),
+             * transition to IN_GAME and release the barrier */
+            if (peer->state == PEER_STATE_LOADING) {
+                peer->state = PEER_STATE_IN_GAME;
+                mp_player_registry_set_status(peer->player_id, MP_PLAYER_IN_GAME);
+
+                /* Commit the join transaction */
+                mp_join_transaction *txn = mp_join_transaction_find_by_peer(
+                    (uint8_t)(peer - session.peers));
+                if (txn && txn->active) {
+                    mp_join_transaction_commit(txn);
+                }
+
+                /* Release join barrier */
+                mp_time_sync_set_join_barrier(0);
+
+                /* Broadcast barrier release event */
+                uint8_t event_buf[16];
+                net_serializer es;
+                net_serializer_init(&es, event_buf, sizeof(event_buf));
+                net_write_u16(&es, NET_EVENT_JOIN_BARRIER_RELEASED);
+                net_write_u32(&es, session.authoritative_tick);
+                net_write_u8(&es, peer->player_id);
+                net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
+                                      (uint32_t)net_serializer_position(&es));
+
+                MP_LOG_INFO("BOOT", "Join barrier released: player %d fully loaded",
+                            (int)peer->player_id);
+            }
             break;
         }
         default:
@@ -738,6 +806,18 @@ static void handle_host_message(const net_packet_header *header,
             mp_spawn_table *table = mp_worldgen_get_spawn_table_mutable();
             table->session_seed = session_seed;
 
+            /* Persist identity to disk for reconnect after app restart */
+            {
+                const mp_game_manifest *manifest = mp_game_manifest_get();
+                const uint8_t *world_uuid = manifest ? manifest->world_instance_uuid : NULL;
+                mp_client_identity_set(assigned_uuid, assigned_token,
+                                        world_uuid,
+                                        NULL, 0, /* host address/port not available here */
+                                        session.local_player_name,
+                                        session.session_id);
+                mp_client_identity_save();
+            }
+
             log_info("Joined session as player", 0, session.local_player_id);
             (void)player_count;
             break;
@@ -765,6 +845,10 @@ static void handle_host_message(const net_packet_header *header,
             break;
         }
         case NET_MSG_START_GAME: {
+            /* DEPRECATED: kept for backward compatibility with older hosts.
+             * New flow uses GAME_START_FINAL for session state transition. */
+            MP_LOG_WARN("NET", "Received deprecated NET_MSG_START_GAME — "
+                        "host may be running an older version");
             net_serializer s;
             net_serializer_init(&s, (uint8_t *)payload, size);
             session.authoritative_tick = net_read_u32(&s);
@@ -775,7 +859,7 @@ static void handle_host_message(const net_packet_header *header,
             /* Update local player status */
             mp_player_registry_set_status(session.local_player_id, MP_PLAYER_IN_GAME);
 
-            log_info("Game started by host", 0, 0);
+            log_info("Game started by host (legacy)", 0, 0);
             break;
         }
         case NET_MSG_HOST_COMMAND_ACK: {
@@ -840,8 +924,38 @@ static void handle_host_message(const net_packet_header *header,
             break;
         }
         case NET_MSG_GAME_START_FINAL: {
+            /* Transition client session state (replaces START_GAME role) */
+            if (session.state != NET_SESSION_CLIENT_GAME) {
+                session.state = NET_SESSION_CLIENT_GAME;
+                session.host_peer.state = PEER_STATE_IN_GAME;
+                mp_player_registry_set_status(session.local_player_id, MP_PLAYER_IN_GAME);
+            }
+            /* Parse start tick and speed from payload */
+            if (size >= 5) {
+                net_serializer s;
+                net_serializer_init(&s, (uint8_t *)payload, size);
+                session.authoritative_tick = net_read_u32(&s);
+                session.game_speed = net_read_u8(&s);
+            }
             extern int mp_bootstrap_client_enter_game(void);
             mp_bootstrap_client_enter_game();
+            break;
+        }
+        case NET_MSG_SAVE_TRANSFER_BEGIN: {
+            mp_save_transfer_client_receive_begin(payload, size);
+            break;
+        }
+        case NET_MSG_SAVE_TRANSFER_CHUNK: {
+            mp_save_transfer_client_receive_chunk(payload, size);
+            break;
+        }
+        case NET_MSG_SAVE_TRANSFER_COMPLETE: {
+            mp_save_transfer_client_receive_complete(payload, size);
+            /* Notify bootstrap that the save transfer is done */
+            extern void mp_bootstrap_client_save_transfer_complete(void);
+            if (mp_save_transfer_get_state() == MP_TRANSFER_COMPLETE) {
+                mp_bootstrap_client_save_transfer_complete();
+            }
             break;
         }
         default:
@@ -1167,15 +1281,30 @@ int net_session_join(const char *player_name, const char *host_address, uint16_t
     strncpy(name_buf, player_name, NET_MAX_PLAYER_NAME - 1);
     net_write_raw(&s, name_buf, NET_MAX_PLAYER_NAME);
 
-    /* If we have a previous UUID (for reconnect), send it */
-    mp_player *local = mp_player_registry_get_local();
-    if (local && local->active) {
-        net_write_raw(&s, local->player_uuid, 16);
-        net_write_raw(&s, local->reconnect_token, 16);
-    } else {
-        uint8_t zeros[16] = {0};
-        net_write_raw(&s, zeros, 16);
-        net_write_raw(&s, zeros, 16);
+    /* Try to load persisted identity for reconnect (survives app restart).
+     * Falls back to in-memory player registry, then zeros. */
+    {
+        uint8_t hello_uuid[16] = {0};
+        uint8_t hello_token[16] = {0};
+        int have_identity = 0;
+
+        /* Priority 1: persisted identity file */
+        if (mp_client_identity_load()) {
+            have_identity = mp_client_identity_get_for_hello(hello_uuid, hello_token);
+        }
+
+        /* Priority 2: in-memory player registry (same session, no restart) */
+        if (!have_identity) {
+            mp_player *local = mp_player_registry_get_local();
+            if (local && local->active) {
+                memcpy(hello_uuid, local->player_uuid, 16);
+                memcpy(hello_token, local->reconnect_token, 16);
+                have_identity = 1;
+            }
+        }
+
+        net_write_raw(&s, hello_uuid, 16);
+        net_write_raw(&s, hello_token, 16);
     }
 
     net_session_send_to_host(NET_MSG_HELLO, hello_buf, (uint32_t)net_serializer_position(&s));
@@ -1243,6 +1372,9 @@ void net_session_disconnect(void)
     session.state = NET_SESSION_IDLE;
     session.role = NET_ROLE_NONE;
     session.peer_count = 0;
+
+    /* Clear persisted client identity on explicit disconnect */
+    mp_client_identity_clear();
 
     log_info("Session disconnected", 0, 0);
     MP_LOG_INFO("SESSION", "Session disconnected — state reset to IDLE");
@@ -1340,39 +1472,40 @@ const net_peer *net_session_get_host_peer(void)
     return &session.host_peer;
 }
 
-int net_session_start_game(void)
+int net_session_transition_to_game(void)
 {
-    if (session.role != NET_ROLE_HOST || session.state != NET_SESSION_HOSTING_LOBBY) {
+    if (session.role != NET_ROLE_HOST) {
+        return 0;
+    }
+
+    /* Allow transition from lobby OR from already hosting game (e.g., resume) */
+    if (session.state != NET_SESSION_HOSTING_LOBBY &&
+        session.state != NET_SESSION_HOSTING_GAME) {
         return 0;
     }
 
     session.state = NET_SESSION_HOSTING_GAME;
-    session.authoritative_tick = 0;
-    session.game_speed = 2; /* Normal speed */
+    if (session.authoritative_tick == 0) {
+        session.game_speed = 2; /* Normal speed */
+    }
 
-    /* Update all player statuses */
+    /* Update host player status */
     mp_player_registry_set_status(0, MP_PLAYER_IN_GAME);
 
-    /* Send START_GAME to all peers */
-    uint8_t buf[8];
-    net_serializer s;
-    net_serializer_init(&s, buf, sizeof(buf));
-    net_write_u32(&s, session.authoritative_tick);
-    net_write_u8(&s, session.game_speed);
-
+    /* Transition all active peers to IN_GAME state.
+     * NOTE: NET_MSG_START_GAME is no longer broadcast here (deprecated).
+     * Clients transition via GAME_START_FINAL instead. */
     for (int i = 0; i < NET_MAX_PEERS; i++) {
         if (session.peers[i].active &&
             (session.peers[i].state == PEER_STATE_READY ||
              session.peers[i].state == PEER_STATE_JOINED)) {
             session.peers[i].state = PEER_STATE_IN_GAME;
             mp_player_registry_set_status(session.peers[i].player_id, MP_PLAYER_IN_GAME);
-            send_raw_to_peer(&session.peers[i], NET_MSG_START_GAME,
-                           buf, (uint32_t)net_serializer_position(&s));
         }
     }
 
-    log_info("Game started", 0, 0);
-    MP_LOG_INFO("SESSION", "Game started: tick=%u speed=%d peers=%d",
+    log_info("Session transitioned to game", 0, 0);
+    MP_LOG_INFO("SESSION", "Session transitioned to game: tick=%u speed=%d peers=%d",
                 session.authoritative_tick, (int)session.game_speed, session.peer_count);
     return 1;
 }

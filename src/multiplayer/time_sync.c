@@ -14,6 +14,7 @@ static struct {
     uint32_t local_tick;      /* Local tick counter */
     int paused;
     uint8_t speed;
+    int join_barrier_active;  /* Simulation frozen for player join */
 } time_data;
 
 void mp_time_sync_init(void)
@@ -41,6 +42,10 @@ void mp_time_sync_init_from_save(void)
 int mp_time_sync_can_advance_tick(void)
 {
     if (time_data.paused) {
+        return 0;
+    }
+
+    if (time_data.join_barrier_active) {
         return 0;
     }
 
@@ -142,6 +147,21 @@ void mp_time_sync_deserialize(const uint8_t *buffer, uint32_t size)
     (void)month;
     (void)day;
     (void)tick;
+}
+
+void mp_time_sync_set_join_barrier(int active)
+{
+    time_data.join_barrier_active = active;
+    if (active) {
+        log_info("Join barrier activated — simulation paused", 0, 0);
+    } else {
+        log_info("Join barrier released — simulation resumed", 0, 0);
+    }
+}
+
+int mp_time_sync_is_join_barrier_active(void)
+{
+    return time_data.join_barrier_active;
 }
 
 #endif /* ENABLE_MULTIPLAYER */

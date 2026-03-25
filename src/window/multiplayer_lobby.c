@@ -187,7 +187,7 @@ static void button_start(const generic_button *button)
     if (!net_session_all_peers_ready()) {
         return;
     }
-    /* Use the bootstrap pipeline instead of raw net_session_start_game().
+    /* Use the bootstrap pipeline instead of raw net_session_transition_to_game().
      * This loads the scenario, initializes subsystems, generates spawns,
      * broadcasts to clients, and transitions to WINDOW_CITY. */
     if (!mp_bootstrap_host_start_game()) {

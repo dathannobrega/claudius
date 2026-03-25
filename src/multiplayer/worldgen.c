@@ -596,6 +596,99 @@ int mp_worldgen_apply_spawns(void)
     return applied;
 }
 
+/* ---- Reserved spawns for late join ---- */
+
+int mp_worldgen_generate_reserved_spawns(int reserve_count)
+{
+    if (reserve_count <= 0) {
+        return 0;
+    }
+    if (reserve_count > MP_WORLDGEN_MAX_SPAWNS) {
+        reserve_count = MP_WORLDGEN_MAX_SPAWNS;
+    }
+
+    /* Collect AI city positions for distance checks */
+    int ai_xs[200], ai_ys[200];
+    int ai_count = collect_ai_trade_cities(ai_xs, ai_ys, 200);
+
+    spawn_candidate candidates[MP_WORLDGEN_MAX_CANDIDATES];
+    int candidate_count = collect_procedural_candidates(
+        candidates, MP_WORLDGEN_MAX_CANDIDATES, ai_xs, ai_ys, ai_count);
+
+    /* Filter out candidates already used by player spawns */
+    spawn_candidate filtered[MP_WORLDGEN_MAX_CANDIDATES];
+    int filtered_count = 0;
+    for (int c = 0; c < candidate_count; c++) {
+        int already_used = 0;
+        for (int s = 0; s < spawn_table.spawn_count; s++) {
+            if (spawn_table.spawns[s].valid &&
+                spawn_table.spawns[s].empire_city_id == candidates[c].city_id) {
+                already_used = 1;
+                break;
+            }
+        }
+        if (!already_used) {
+            filtered[filtered_count++] = candidates[c];
+        }
+    }
+
+    /* Select from filtered candidates */
+    mp_spawn_entry temp_spawns[MP_WORLDGEN_MAX_SPAWNS];
+    memset(temp_spawns, 0, sizeof(temp_spawns));
+
+    int selected = select_spawns_from_candidates(filtered, filtered_count,
+        temp_spawns, reserve_count, ai_xs, ai_ys, ai_count);
+
+    /* Copy to reserved_spawns */
+    spawn_table.reserved_count = 0;
+    for (int i = 0; i < selected && i < MP_WORLDGEN_MAX_SPAWNS; i++) {
+        spawn_table.reserved_spawns[i] = temp_spawns[i];
+        spawn_table.reserved_spawns[i].slot_id = 0xFF; /* Unassigned */
+        spawn_table.reserved_count++;
+    }
+
+    log_info("Worldgen: reserved spawns generated", 0, spawn_table.reserved_count);
+    return spawn_table.reserved_count;
+}
+
+int mp_worldgen_assign_reserved_spawn(uint8_t slot_id)
+{
+    for (int i = 0; i < spawn_table.reserved_count; i++) {
+        if (spawn_table.reserved_spawns[i].valid) {
+            int city_id = spawn_table.reserved_spawns[i].empire_city_id;
+            spawn_table.reserved_spawns[i].slot_id = slot_id;
+            spawn_table.reserved_spawns[i].valid = 0; /* Mark as consumed */
+            log_info("Worldgen: assigned reserved spawn to slot", 0, (int)slot_id);
+            return city_id;
+        }
+    }
+    return -1;
+}
+
+void mp_worldgen_return_to_reserved(int empire_city_id)
+{
+    for (int i = 0; i < spawn_table.reserved_count; i++) {
+        if (!spawn_table.reserved_spawns[i].valid &&
+            spawn_table.reserved_spawns[i].empire_city_id == empire_city_id) {
+            spawn_table.reserved_spawns[i].valid = 1;
+            spawn_table.reserved_spawns[i].slot_id = 0xFF;
+            log_info("Worldgen: returned city to reserved pool", 0, empire_city_id);
+            return;
+        }
+    }
+}
+
+int mp_worldgen_get_reserved_count(void)
+{
+    int count = 0;
+    for (int i = 0; i < spawn_table.reserved_count; i++) {
+        if (spawn_table.reserved_spawns[i].valid) {
+            count++;
+        }
+    }
+    return count;
+}
+
 /* ---- Serialization ---- */
 
 void mp_worldgen_serialize(uint8_t *buffer, uint32_t *size)
@@ -611,6 +704,23 @@ void mp_worldgen_serialize(uint8_t *buffer, uint32_t *size)
 
     for (int i = 0; i < spawn_table.spawn_count; i++) {
         mp_spawn_entry *e = &spawn_table.spawns[i];
+        net_write_u8(&s, (uint8_t)e->valid);
+        net_write_u8(&s, e->slot_id);
+        net_write_i32(&s, e->empire_city_id);
+        net_write_i32(&s, e->empire_object_id);
+        net_write_i32(&s, e->x);
+        net_write_i32(&s, e->y);
+        net_write_u8(&s, (uint8_t)e->is_sea_trade);
+        net_write_u8(&s, (uint8_t)e->is_land_trade);
+        net_write_i32(&s, e->nearest_ai_distance);
+        net_write_i32(&s, e->nearest_player_distance);
+        net_write_i32(&s, e->fairness_score);
+    }
+
+    /* Serialize reserved spawns */
+    net_write_u8(&s, spawn_table.reserved_count);
+    for (int i = 0; i < spawn_table.reserved_count; i++) {
+        mp_spawn_entry *e = &spawn_table.reserved_spawns[i];
         net_write_u8(&s, (uint8_t)e->valid);
         net_write_u8(&s, e->slot_id);
         net_write_i32(&s, e->empire_city_id);
@@ -653,6 +763,28 @@ void mp_worldgen_deserialize(const uint8_t *buffer, uint32_t size)
         e->nearest_ai_distance = net_read_i32(&s);
         e->nearest_player_distance = net_read_i32(&s);
         e->fairness_score = net_read_i32(&s);
+    }
+
+    /* Deserialize reserved spawns (if present in buffer) */
+    if (!net_serializer_has_overflow(&s) && net_serializer_remaining(&s) > 0) {
+        spawn_table.reserved_count = net_read_u8(&s);
+        if (spawn_table.reserved_count > MP_WORLDGEN_MAX_SPAWNS) {
+            spawn_table.reserved_count = MP_WORLDGEN_MAX_SPAWNS;
+        }
+        for (int i = 0; i < spawn_table.reserved_count && !net_serializer_has_overflow(&s); i++) {
+            mp_spawn_entry *e = &spawn_table.reserved_spawns[i];
+            e->valid = net_read_u8(&s);
+            e->slot_id = net_read_u8(&s);
+            e->empire_city_id = net_read_i32(&s);
+            e->empire_object_id = net_read_i32(&s);
+            e->x = net_read_i32(&s);
+            e->y = net_read_i32(&s);
+            e->is_sea_trade = net_read_u8(&s);
+            e->is_land_trade = net_read_u8(&s);
+            e->nearest_ai_distance = net_read_i32(&s);
+            e->nearest_player_distance = net_read_i32(&s);
+            e->fairness_score = net_read_i32(&s);
+        }
     }
 }
 

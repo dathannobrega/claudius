@@ -10,7 +10,7 @@
  *
  * Orchestrates the critical path from lobby to gameplay:
  *
- * HOST flow:
+ * HOST FRESH START:
  *   1. Host selects scenario in host_setup window
  *   2. mp_bootstrap_set_scenario() records the selection
  *   3. Host clicks Start in lobby → mp_bootstrap_host_start_game()
@@ -22,13 +22,27 @@
  *   9. Host sends GAME_START_FINAL
  *  10. Transition to WINDOW_CITY
  *
- * CLIENT flow:
+ * HOST RESUME:
+ *   1. Load save → rebind
+ *   2. Send GAME_PREPARE (manifest)
+ *   3. Chunked save transfer to clients
+ *   4. Send FULL_SNAPSHOT (latest MP state)
+ *   5. Send GAME_START_FINAL
+ *
+ * CLIENT FRESH START:
  *   1. Receives GAME_PREPARE → stores manifest
  *   2. mp_bootstrap_client_prepare() loads the same scenario locally
  *   3. mp_bootstrap_bind_loaded_scenario() initializes MP subsystems
  *   4. Receives spawn table via HOST_EVENT
  *   5. Receives GAME_START_FINAL → mp_bootstrap_client_enter_game()
  *   6. Transition to WINDOW_CITY
+ *
+ * CLIENT RESUME:
+ *   1. Receive GAME_PREPARE
+ *   2. Receive save file chunks → write temp → load
+ *   3. Rebind MP subsystems
+ *   4. Receive + apply FULL_SNAPSHOT
+ *   5. Receive GAME_START_FINAL → enter game
  */
 
 typedef enum {
@@ -38,6 +52,7 @@ typedef enum {
     MP_BOOT_PREPARING,          /* GAME_PREPARE sent, loading locally */
     MP_BOOT_LOADED,             /* Scenario loaded, subsystems bound */
     MP_BOOT_RESUME_LOBBY,       /* Waiting for players to reconnect */
+    MP_BOOT_SAVE_TRANSFER,      /* Host sending save / client receiving save */
     MP_BOOT_IN_GAME             /* Playing */
 } mp_boot_state;
 
@@ -120,9 +135,24 @@ int mp_bootstrap_host_resume_game(void);
 
 /**
  * HOST: Launch the resumed game after players reconnect in resume lobby.
+ * This is now non-blocking: it starts the save transfer and returns.
+ * Call mp_bootstrap_update() each frame to drive the transfer.
  * @return 1 on success, 0 on failure
  */
 int mp_bootstrap_host_launch_resumed_game(void);
+
+/**
+ * Update the bootstrap pipeline. Call each frame.
+ * Drives the save transfer on the host side.
+ * When transfer completes, finalizes the resume and enters game.
+ */
+void mp_bootstrap_update(void);
+
+/**
+ * CLIENT: Called when save transfer completes.
+ * Writes received data to temp file, loads it, rebinds subsystems.
+ */
+void mp_bootstrap_client_save_transfer_complete(void);
 
 /**
  * COMMON: Rebind subsystems after loading a save (NOT a fresh scenario).
