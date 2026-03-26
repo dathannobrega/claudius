@@ -44,10 +44,9 @@ void multiplayer_runtime_update(void)
     if (was_active) {
         net_session_update();
 
-        /* Host: keep the announced player count in sync with reality */
+        /* Host: keep the announced session metadata in sync with reality */
         if (net_session_is_host()) {
-            int peer_count = net_session_get_peer_count();
-            net_discovery_update_announcing((uint8_t)(peer_count + 1)); /* +1 for host */
+            net_session_refresh_discovery_announcement();
         }
     }
 

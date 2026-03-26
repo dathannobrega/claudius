@@ -6,6 +6,7 @@
 #include "ownership.h"
 #include "empire_sync.h"
 #include "trade_sync.h"
+#include "mp_trade_route.h"
 #include "time_sync.h"
 #include "checksum.h"
 #include "command_bus.h"
@@ -22,11 +23,12 @@
 
 #define DOMAIN_BUFFER_SIZE 32768
 
-/* v2 header wire size = 58 bytes, v3 = 62 bytes, v4 = 73 bytes, v5 = 93 bytes */
+/* v2 header wire size = 58 bytes, v3 = 62 bytes, v4 = 73 bytes, v5 = 93 bytes, v6 = 97 bytes */
 #define HEADER_V2_SIZE 58
 #define HEADER_V3_SIZE 62
 #define HEADER_V4_SIZE 73
 #define HEADER_V5_SIZE 93  /* v4 + 16 bytes world_uuid + 4 bytes header_checksum */
+#define HEADER_V6_SIZE 97  /* v5 + 4 bytes p2p_routes_size */
 
 /* FNV-1a 32-bit checksum */
 #define FNV_OFFSET 2166136261u
@@ -75,7 +77,7 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
     header.compat_flags = MP_SAVE_FLAG_HAS_P2P_ROUTES | MP_SAVE_FLAG_HAS_TRADE_SYNC;
 
     /* Serialize each domain into temporary buffers */
-    uint8_t *temp = (uint8_t *)malloc(DOMAIN_BUFFER_SIZE * 7);
+    uint8_t *temp = (uint8_t *)malloc(DOMAIN_BUFFER_SIZE * 8);
     if (!temp) {
         log_error("Failed to allocate save buffer", 0, 0);
         return 0;
@@ -87,7 +89,8 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
     uint8_t *empire_buf = temp + DOMAIN_BUFFER_SIZE * 3;
     uint8_t *routes_buf = temp + DOMAIN_BUFFER_SIZE * 4;
     uint8_t *traders_buf = temp + DOMAIN_BUFFER_SIZE * 5;
-    uint8_t *time_buf = temp + DOMAIN_BUFFER_SIZE * 6;
+    uint8_t *p2p_routes_buf = temp + DOMAIN_BUFFER_SIZE * 6;
+    uint8_t *time_buf = temp + DOMAIN_BUFFER_SIZE * 7;
 
     mp_player_registry_serialize(player_buf, &header.player_registry_size);
     mp_ownership_serialize(ownership_buf, &header.ownership_size);
@@ -95,6 +98,7 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
     mp_empire_sync_serialize(empire_buf, &header.empire_sync_size);
     mp_trade_sync_serialize_routes(routes_buf, &header.trade_sync_routes_size);
     mp_trade_sync_serialize_traders(traders_buf, &header.trade_sync_traders_size);
+    mp_trade_route_serialize(p2p_routes_buf, &header.p2p_routes_size, DOMAIN_BUFFER_SIZE);
     mp_time_sync_serialize(time_buf, &header.time_sync_size);
 
     /* Calculate total payload (all domains concatenated) */
@@ -104,25 +108,28 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
                               + header.empire_sync_size
                               + header.trade_sync_routes_size
                               + header.trade_sync_traders_size
+                              + header.p2p_routes_size
                               + header.time_sync_size;
 
     /* v5: compute per-domain FNV-1a checksums */
     mp_domain_entry domain_table[MP_SAVE_DOMAIN_COUNT];
     {
         const uint8_t *bufs[] = { player_buf, ownership_buf, worldgen_buf,
-                                   empire_buf, routes_buf, traders_buf, time_buf };
+                                   empire_buf, routes_buf, traders_buf,
+                                   p2p_routes_buf, time_buf };
         const uint32_t sizes[] = {
             header.player_registry_size, header.ownership_size, header.worldgen_size,
             header.empire_sync_size, header.trade_sync_routes_size,
-            header.trade_sync_traders_size, header.time_sync_size
+            header.trade_sync_traders_size, header.p2p_routes_size,
+            header.time_sync_size
         };
         const uint8_t tags[] = {
             MP_DOMAIN_TAG_PLAYER_REGISTRY, MP_DOMAIN_TAG_OWNERSHIP,
             MP_DOMAIN_TAG_WORLDGEN, MP_DOMAIN_TAG_EMPIRE_SYNC,
             MP_DOMAIN_TAG_TRADE_SYNC_ROUTES, MP_DOMAIN_TAG_TRADE_SYNC_TRADERS,
-            MP_DOMAIN_TAG_TIME_SYNC
+            MP_DOMAIN_TAG_P2P_ROUTES, MP_DOMAIN_TAG_TIME_SYNC
         };
-        for (int b = 0; b < 7; b++) {
+        for (int b = 0; b < MP_SAVE_DOMAIN_COUNT; b++) {
             domain_table[b].tag = tags[b];
             domain_table[b].size = sizes[b];
             domain_table[b].checksum = compute_fnv1a(bufs[b], sizes[b]);
@@ -131,7 +138,7 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
 
     /* v5: domain table size = 9 bytes per domain (tag + size + checksum) */
     uint32_t domain_table_wire_size = (uint32_t)(MP_SAVE_DOMAIN_COUNT * 9);
-    uint32_t total = HEADER_V5_SIZE + domain_table_wire_size + header.total_payload_size;
+    uint32_t total = HEADER_V6_SIZE + domain_table_wire_size + header.total_payload_size;
 
     if (total > buffer_size) {
         log_error("Save buffer too small", 0, (int)total);
@@ -143,13 +150,15 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
     {
         uint32_t running = 0x12345678;
         const uint8_t *bufs[] = { player_buf, ownership_buf, worldgen_buf,
-                                   empire_buf, routes_buf, traders_buf, time_buf };
+                                   empire_buf, routes_buf, traders_buf,
+                                   p2p_routes_buf, time_buf };
         const uint32_t sizes[] = {
             header.player_registry_size, header.ownership_size, header.worldgen_size,
             header.empire_sync_size, header.trade_sync_routes_size,
-            header.trade_sync_traders_size, header.time_sync_size
+            header.trade_sync_traders_size, header.p2p_routes_size,
+            header.time_sync_size
         };
-        for (int b = 0; b < 7; b++) {
+        for (int b = 0; b < MP_SAVE_DOMAIN_COUNT; b++) {
             for (uint32_t i = 0; i < sizes[b]; i++) {
                 running = ((running << 5) | (running >> 27)) ^ bufs[b][i];
             }
@@ -183,6 +192,7 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
     net_write_u32(&s, header.empire_sync_size);
     net_write_u32(&s, header.trade_sync_routes_size);
     net_write_u32(&s, header.trade_sync_traders_size);
+    net_write_u32(&s, header.p2p_routes_size);
     net_write_u32(&s, header.time_sync_size);
     net_write_u32(&s, header.next_command_sequence_id);
     /* v4 fields */
@@ -211,6 +221,7 @@ int mp_session_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *o
     net_write_raw(&s, empire_buf, header.empire_sync_size);
     net_write_raw(&s, routes_buf, header.trade_sync_routes_size);
     net_write_raw(&s, traders_buf, header.trade_sync_traders_size);
+    net_write_raw(&s, p2p_routes_buf, header.p2p_routes_size);
     net_write_raw(&s, time_buf, header.time_sync_size);
 
     *out_size = (uint32_t)net_serializer_position(&s);
@@ -234,7 +245,9 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
 
     /* Validate total payload fits in the buffer */
     uint32_t header_wire_size;
-    if (header.version >= 5) {
+    if (header.version >= 6) {
+        header_wire_size = HEADER_V6_SIZE;
+    } else if (header.version >= 5) {
         header_wire_size = HEADER_V5_SIZE;
     } else if (header.version >= 4) {
         header_wire_size = HEADER_V4_SIZE;
@@ -250,6 +263,7 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
                             + header.empire_sync_size
                             + header.trade_sync_routes_size
                             + header.trade_sync_traders_size
+                            + header.p2p_routes_size
                             + header.time_sync_size;
 
     /* v5: validate file size limits */
@@ -261,8 +275,9 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
 
     /* v5: validate header checksum */
     if (header.version >= 5 && header.header_checksum != 0) {
-        /* Header checksum covers bytes 0..(HEADER_V5_SIZE - 4) */
-        uint32_t actual_hdr_cksum = compute_fnv1a(buffer, HEADER_V5_SIZE - 4);
+        uint32_t checksum_header_size = (header.version >= 6) ? HEADER_V6_SIZE : HEADER_V5_SIZE;
+        /* Header checksum covers bytes 0..(header_size - 4) */
+        uint32_t actual_hdr_cksum = compute_fnv1a(buffer, checksum_header_size - 4);
         if (actual_hdr_cksum != header.header_checksum) {
             log_error("Multiplayer save: header checksum mismatch", 0,
                       (int)actual_hdr_cksum);
@@ -406,6 +421,18 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
         s.position += header.trade_sync_traders_size;
     }
 
+    if (header.p2p_routes_size > 0) {
+        if (s.position + header.p2p_routes_size > size) {
+            log_error("Save truncated at p2p_routes domain", 0, 0);
+            return 0;
+        }
+        {
+            const uint8_t *data = buffer + s.position;
+            mp_trade_route_deserialize(data, header.p2p_routes_size);
+        }
+        s.position += header.p2p_routes_size;
+    }
+
     if (header.time_sync_size > 0) {
         if (s.position + header.time_sync_size > size) {
             log_error("Save truncated at time_sync domain", 0, 0);
@@ -420,6 +447,22 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
      * Use init_from_save to avoid the reset-then-set race condition. */
     if (header.next_command_sequence_id > 0) {
         mp_command_bus_init_from_save(header.next_command_sequence_id);
+    }
+
+    /* Restore manifest metadata needed by reconnect/discovery after a saved game load. */
+    {
+        mp_game_manifest *manifest = mp_game_manifest_get_mutable();
+        if (manifest) {
+            manifest->mode = MP_GAME_MODE_SAVED_GAME;
+            manifest->save_version = header.version;
+            manifest->session_seed = header.session_seed;
+            manifest->player_count = header.player_count;
+            manifest->max_players = NET_MAX_PLAYERS;
+            manifest->feature_flags = header.compat_flags;
+            memcpy(manifest->world_instance_uuid, header.world_instance_uuid,
+                   MP_WORLD_UUID_SIZE);
+            manifest->valid = 1;
+        }
     }
 
     /* Mark all non-host players as awaiting_reconnect */
@@ -480,6 +523,11 @@ int mp_session_save_read_header(const uint8_t *buffer, uint32_t size, mp_save_he
     header->empire_sync_size = net_read_u32(&s);
     header->trade_sync_routes_size = net_read_u32(&s);
     header->trade_sync_traders_size = net_read_u32(&s);
+    if (header->version >= 6) {
+        header->p2p_routes_size = net_read_u32(&s);
+    } else {
+        header->p2p_routes_size = 0;
+    }
     header->time_sync_size = net_read_u32(&s);
 
     if (header->magic != MP_SAVE_MAGIC) {
@@ -488,6 +536,10 @@ int mp_session_save_read_header(const uint8_t *buffer, uint32_t size, mp_save_he
     }
     if (header->version > MP_SAVE_VERSION) {
         log_error("Unsupported multiplayer save version", 0, (int)header->version);
+        return 0;
+    }
+    if (header->version >= 6 && size < HEADER_V6_SIZE) {
+        log_error("Save too small for v6 header", 0, (int)size);
         return 0;
     }
 
@@ -519,7 +571,7 @@ int mp_session_save_read_header(const uint8_t *buffer, uint32_t size, mp_save_he
     }
 
     /* v5: world_instance_uuid and header_checksum */
-    if (header->version >= 5 && size >= HEADER_V5_SIZE) {
+    if (header->version >= 5 && size >= ((header->version >= 6) ? HEADER_V6_SIZE : HEADER_V5_SIZE)) {
         net_read_raw(&s, header->world_instance_uuid, MP_WORLD_UUID_SIZE);
         header->header_checksum = net_read_u32(&s);
     } else {

@@ -73,6 +73,7 @@ int net_session_join(const char *player_name, const char *host_address, uint16_t
 /* Common operations */
 void net_session_disconnect(void);
 void net_session_update(void);
+void net_session_refresh_discovery_announcement(void);
 
 /* State queries */
 int net_session_is_active(void);

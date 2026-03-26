@@ -235,48 +235,49 @@ static void draw_resource_status_text(int resource, int x, int y, int box_width)
  * Shows P2P/AI tag and route state for resources that have active trade routes
  * involving player-owned cities.
  */
+static int advisor_local_trade_city(void)
+{
+    if (!net_session_is_active()) {
+        return -1;
+    }
+    return mp_ownership_find_local_city();
+}
+
 static void draw_mp_route_indicator(int resource, int x, int y, int width)
 {
     if (!net_session_is_active()) {
         return;
     }
 
-    /* Check all trade cities to see if this resource is traded through a player route */
+    int local_city_id = advisor_local_trade_city();
+    if (local_city_id < 0) {
+        return;
+    }
+
     int array_size = empire_city_get_array_size();
     int found_p2p_route = 0;
-    int found_route_id = -1;
+    int found_route = 0;
     mp_route_state worst_state = MP_ROUTE_STATE_ACTIVE;
 
     for (int i = 0; i < array_size; i++) {
-        const empire_city *city = empire_city_get(i);
-        if (!city->in_use || city->type != EMPIRE_CITY_TRADE || !city->is_open) {
+        trade_route_view view;
+        if (!trade_route_get_view_for_city_pair(local_city_id, i, &view) || view.route_id < 0) {
             continue;
         }
-        if (!empire_city_is_player_owned(i)) {
+        if (!view.counterpart_sells[resource] && !view.counterpart_buys[resource]) {
             continue;
         }
-        int route_id = city->route_id;
-        if (route_id < 0) {
-            continue;
-        }
-        /* Check if this route trades this resource */
-        int buys = city->buys_resource[resource];
-        int sells = city->sells_resource[resource];
-        if (!buys && !sells) {
-            continue;
-        }
-        /* Found a player route that trades this resource */
-        found_route_id = route_id;
-        if (mp_ownership_is_route_player_to_player(route_id)) {
+        found_route = 1;
+        if (view.is_player_to_player) {
             found_p2p_route = 1;
         }
-        mp_route_state rstate = mp_ownership_get_route_state(route_id);
+        mp_route_state rstate = (mp_route_state)view.state;
         if (rstate > worst_state) {
             worst_state = rstate;
         }
     }
 
-    if (found_route_id < 0) {
+    if (!found_route) {
         return;
     }
 
@@ -408,7 +409,26 @@ static void button_policy(const generic_button *button)
 
 static void button_resource(const grid_box_item *item)
 {
-    window_resource_settings_show(data.list.items[item->index]);
+    resource_type resource = data.list.items[item->index];
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        int local_city_id = advisor_local_trade_city();
+        if (local_city_id >= 0) {
+            int array_size = empire_city_get_array_size();
+            for (int i = 0; i < array_size; i++) {
+                trade_route_view view;
+                if (!trade_route_get_view_for_city_pair(local_city_id, i, &view) || view.route_id < 0) {
+                    continue;
+                }
+                if (view.counterpart_sells[resource] || view.counterpart_buys[resource]) {
+                    window_resource_settings_show_for_route(resource, view.route_id);
+                    return;
+                }
+            }
+        }
+    }
+#endif
+    window_resource_settings_show(resource);
 }
 
 static void write_resource_storage_tooltip(tooltip_context *c, resource_type resource)

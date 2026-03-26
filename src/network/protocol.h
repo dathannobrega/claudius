@@ -5,7 +5,7 @@
 
 #include <stdint.h>
 
-#define NET_PROTOCOL_VERSION        2
+#define NET_PROTOCOL_VERSION        3
 #define NET_MAX_PAYLOAD_SIZE        65536
 #define NET_MAX_PLAYER_NAME         32
 #define NET_MAX_PLAYERS             8
@@ -49,7 +49,13 @@ typedef enum {
     NET_REJECT_GAME_IN_PROGRESS,
     NET_REJECT_NAME_TAKEN,
     NET_REJECT_BANNED,
-    NET_REJECT_NO_RESERVED_SLOTS  /* Late join: no reserved city slots available */
+    NET_REJECT_NO_RESERVED_SLOTS,
+    NET_REJECT_LATE_JOIN_BUSY,
+    NET_REJECT_RECONNECT_REQUIRED,
+    NET_REJECT_SLOT_NOT_FOUND,
+    NET_REJECT_WORLD_MISMATCH,
+    NET_REJECT_RESUME_GENERATION_MISMATCH,
+    NET_REJECT_INTERNAL_ERROR
 } net_reject_reason;
 
 typedef enum {
@@ -108,6 +114,9 @@ typedef struct {
     char player_name[NET_MAX_PLAYER_NAME];
     uint8_t player_uuid[16];
     uint8_t reconnect_token[16];
+    uint8_t slot_id;
+    uint8_t world_instance_uuid[16];
+    uint32_t resume_generation;
 } net_msg_hello;
 
 typedef struct {
@@ -118,6 +127,8 @@ typedef struct {
     uint8_t player_count;
     uint8_t player_uuid[16];
     uint8_t reconnect_token[16];
+    uint8_t world_instance_uuid[16];
+    uint32_t resume_generation;
 } net_msg_join_accept;
 
 typedef struct {

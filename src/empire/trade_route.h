@@ -4,6 +4,8 @@
 #include "core/buffer.h"
 #include "game/resource.h"
 
+#include <stdint.h>
+
 typedef enum {
     RESOURCE_BUYS = -1,
     RESOURCE_SELLS = 1,
@@ -11,6 +13,32 @@ typedef enum {
 } city_resource_state;
 
 #define LEGACY_MAX_ROUTES 20
+
+typedef struct {
+    int valid;
+    int route_id;
+    uint32_t route_key;
+    int local_city_id;
+    int counterpart_city_id;
+    int is_player_to_player;
+    int is_open;
+    int is_drawable;
+    int counterpart_online;
+    int transport;
+    int state;
+    int counterpart_sells[RESOURCE_MAX];
+    int counterpart_buys[RESOURCE_MAX];
+    int display_sell_limit[RESOURCE_MAX];
+    int display_sell_traded[RESOURCE_MAX];
+    int display_buy_limit[RESOURCE_MAX];
+    int display_buy_traded[RESOURCE_MAX];
+    int route_export_enabled[RESOURCE_MAX];
+    int route_import_enabled[RESOURCE_MAX];
+    int route_export_limit[RESOURCE_MAX];
+    int route_import_limit[RESOURCE_MAX];
+    int route_exported_this_year[RESOURCE_MAX];
+    int route_imported_this_year[RESOURCE_MAX];
+} trade_route_view;
 
 int trade_route_init(void);
 
@@ -27,6 +55,9 @@ int trade_route_ensure_id(int route_id);
 int trade_route_count(void);
 
 int trade_route_is_valid(int route_id);
+int empire_city_get_primary_legacy_route_id(int city_id);
+int trade_route_get_view_for_city_pair(int local_city_id, int counterpart_city_id, trade_route_view *out);
+int trade_route_list_for_city(int city_id, trade_route_view *out, int max_routes);
 
 void trade_route_set(int route_id, resource_type resource, int limit, int buying);
 

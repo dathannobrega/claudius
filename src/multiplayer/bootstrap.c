@@ -218,7 +218,8 @@ static void broadcast_spawn_table(void)
 static void broadcast_join_barrier_event(uint16_t event_type, uint8_t player_id)
 {
     if (!net_session_is_host() || !net_session_is_in_game()) {
-        return;
+        reject_reason = NET_REJECT_LATE_JOIN_BUSY;
+        goto fail;
     }
 
     uint8_t event_buf[16];
@@ -353,10 +354,7 @@ int mp_bootstrap_host_start_game(void)
         }
     }
 
-    /* 10. Stop LAN discovery announcing (game is in progress) */
-    net_discovery_stop_announcing();
-
-    /* 11. Transition to WINDOW_CITY */
+    /* 12. Transition to WINDOW_CITY */
     boot_data.state = MP_BOOT_IN_GAME;
     window_city_show();
 
@@ -490,6 +488,11 @@ int mp_bootstrap_is_resume(void)
     return boot_data.is_resume;
 }
 
+int mp_bootstrap_is_late_join_busy(void)
+{
+    return boot_data.late_join.active;
+}
+
 void mp_bootstrap_set_save(const char *save_filename)
 {
     if (!save_filename || !save_filename[0]) {
@@ -527,15 +530,18 @@ void mp_bootstrap_rebind_loaded_save(void)
     /* 3. Unify restored tick values */
     mp_time_sync_init_from_save();
 
-    /* 4. Re-apply empire city ownership flags from deserialized data */
+    /* 4. Re-mark the local player before rebuilding any local/remote ownership view. */
+    mp_player_registry_mark_local_player(net_session_get_local_player_id());
+
+    /* 5. Re-apply empire city ownership flags from deserialized data */
     mp_ownership_reapply_city_owners();
 
-    /* 5. Re-register cities for trade view replication */
+    /* 6. Re-register cities for trade view replication */
     if (net_session_is_host()) {
         mp_empire_sync_reregister_all_player_cities();
     }
 
-    /* 6. Initialize autosave system on host */
+    /* 7. Initialize autosave system on host */
     if (net_session_is_host()) {
         mp_autosave_init();
         mp_autosave_mark_dirty(MP_DIRTY_RECONNECT); /* Mark dirty so first autosave captures state */
@@ -632,9 +638,6 @@ static void mp_bootstrap_host_finalize_resume(void)
                               (uint32_t)net_serializer_position(&ss));
     }
 
-    /* Stop LAN discovery */
-    net_discovery_stop_announcing();
-
     /* Transition to gameplay */
     boot_data.state = MP_BOOT_IN_GAME;
     window_city_show();
@@ -725,7 +728,8 @@ void mp_bootstrap_update(void)
         }
         /* Transfer complete — finalize the resume */
         mp_bootstrap_host_finalize_resume();
-        return;
+        reject_reason = NET_REJECT_LATE_JOIN_BUSY;
+        goto fail;
     }
 
     if (net_session_is_host() && boot_data.late_join.transfer_in_progress) {
@@ -831,21 +835,23 @@ void mp_bootstrap_host_complete_late_join(uint8_t peer_index)
 
 /* ---- Phase 6: Late join handler ---- */
 
-void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_name)
+int mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_name,
+                                       uint8_t *out_reject_reason)
 {
+    uint8_t reject_reason = NET_REJECT_INTERNAL_ERROR;
     if (!net_session_is_host()) {
-        return;
+        goto fail;
     }
     if (boot_data.late_join.active) {
         MP_LOG_WARN("BOOT", "Late join already in progress â€” rejecting new request");
-        return;
+        reject_reason = NET_REJECT_LATE_JOIN_BUSY;
+        goto fail;
     }
 
-    extern int mp_worldgen_get_reserved_count(void);
     if (mp_worldgen_get_reserved_count() <= 0) {
         MP_LOG_ERROR("BOOT", "No reserved slots for late join");
-        /* Reject will be handled by caller */
-        return;
+        reject_reason = NET_REJECT_NO_RESERVED_SLOTS;
+        goto fail;
     }
 
     /* 1. Activate join barrier — pauses simulation for all players */
@@ -860,7 +866,7 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
         MP_LOG_ERROR("BOOT", "Failed to create join transaction");
         mp_time_sync_set_join_barrier(0);
         broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, 0);
-        return;
+        goto fail;
     }
 
     /* 3. Register player in registry */
@@ -874,9 +880,10 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
     }
     if (new_player_id == 0) {
         MP_LOG_ERROR("BOOT", "No free player ID for late join");
+        reject_reason = NET_REJECT_SESSION_FULL;
         mp_join_transaction_rollback(txn);
         broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, 0);
-        return;
+        goto fail;
     }
 
     mp_player_registry_add(new_player_id, player_name, 0, 0);
@@ -890,9 +897,10 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
     int city_id = mp_worldgen_assign_reserved_spawn((uint8_t)slot_id);
     if (city_id < 0) {
         MP_LOG_ERROR("BOOT", "No reserved city available for late join");
+        reject_reason = NET_REJECT_NO_RESERVED_SLOTS;
         mp_join_transaction_rollback(txn);
         broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, 0);
-        return;
+        goto fail;
     }
     txn->assigned_city_id = city_id;
 
@@ -935,8 +943,15 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
     /* 8. Send JOIN_ACCEPT */
     {
         mp_player *player = mp_player_registry_get(new_player_id);
-        uint8_t accept_buf[128];
+        const mp_game_manifest *manifest = mp_game_manifest_get();
+        uint8_t world_uuid[MP_WORLD_UUID_SIZE] = {0};
+        uint8_t accept_buf[160];
         net_serializer as;
+
+        if (manifest && manifest->valid) {
+            memcpy(world_uuid, manifest->world_instance_uuid, MP_WORLD_UUID_SIZE);
+        }
+
         net_serializer_init(&as, accept_buf, sizeof(accept_buf));
         net_write_u8(&as, new_player_id);
         net_write_u8(&as, (uint8_t)slot_id);
@@ -951,6 +966,8 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
             net_write_raw(&as, zeros, 16);
             net_write_raw(&as, zeros, 16);
         }
+        net_write_raw(&as, world_uuid, MP_WORLD_UUID_SIZE);
+        net_write_u32(&as, net_session_get()->session_id);
         net_session_send_to_peer(peer_index, NET_MSG_JOIN_ACCEPT,
                                  accept_buf, (uint32_t)net_serializer_position(&as));
     }
@@ -970,20 +987,22 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
         const char *checkpoint_path = mp_safe_file_get_save_path("mp_latejoin_checkpoint.sav");
         if (!game_file_write_saved_game(checkpoint_path)) {
             MP_LOG_ERROR("BOOT", "Failed to write late join checkpoint");
+            reject_reason = NET_REJECT_INTERNAL_ERROR;
             mp_join_transaction_rollback(txn);
             mp_time_sync_set_join_barrier(0);
             broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, new_player_id);
-            return;
+            goto fail;
         }
 
         mp_save_transfer_init();
         if (!mp_save_transfer_host_begin_for_peer(checkpoint_path, peer_index)) {
             MP_LOG_ERROR("BOOT", "Failed to start peer-scoped late join transfer");
+            reject_reason = NET_REJECT_INTERNAL_ERROR;
             platform_file_manager_remove_file(checkpoint_path);
             mp_join_transaction_rollback(txn);
             mp_time_sync_set_join_barrier(0);
             broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, new_player_id);
-            return;
+            goto fail;
         }
 
         platform_file_manager_remove_file(checkpoint_path);
@@ -1001,6 +1020,16 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
     MP_LOG_INFO("BOOT", "Late join initiated: player '%s' (id=%d, slot=%d, city=%d) — "
                 "waiting for GAME_LOAD_COMPLETE",
                 player_name, (int)new_player_id, slot_id, city_id);
+    if (out_reject_reason) {
+        *out_reject_reason = 0;
+    }
+    return 1;
+
+fail:
+    if (out_reject_reason) {
+        *out_reject_reason = reject_reason;
+    }
+    return 0;
 }
 
 #endif /* ENABLE_MULTIPLAYER */

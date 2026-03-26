@@ -16,6 +16,11 @@
 #include "input/mouse.h"
 #include "translation/translation.h"
 
+#ifdef ENABLE_MULTIPLAYER
+#include "multiplayer/ownership.h"
+#include "network/session.h"
+#endif
+
 #include <string.h>
 
 #define NO_POSITION ((unsigned int) -1)
@@ -78,6 +83,29 @@ static int get_city_trade_quota_fill(const empire_city *city, int is_sell)
 {
     int total_now = 0;
     int total_max = 0;
+    trade_route_view route_view;
+    int local_city_id = -1;
+
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        local_city_id = mp_ownership_find_local_city();
+    }
+#endif
+
+    if (trade_route_get_view_for_city_pair(local_city_id, empire_city_get_for_object(city->empire_object_id), &route_view) &&
+        route_view.route_id >= 0) {
+        for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
+            if (!resource_is_storable(r)) continue;
+            if ((is_sell && !route_view.counterpart_sells[r]) ||
+                (!is_sell && !route_view.counterpart_buys[r])) continue;
+
+            total_max += is_sell ? route_view.display_sell_limit[r] : route_view.display_buy_limit[r];
+            total_now += is_sell ? route_view.display_sell_traded[r] : route_view.display_buy_traded[r];
+        }
+
+        if (total_max == 0) return 0;
+        return (100 * total_now) / total_max;
+    }
 
     for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
         if (!resource_is_storable(r)) continue;

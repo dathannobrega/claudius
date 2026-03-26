@@ -95,6 +95,11 @@ uint32_t mp_trade_route_create(uint8_t origin_player_id, int origin_city_id,
                                 uint8_t dest_player_id, int dest_city_id,
                                 int claudius_route_id, uint32_t network_route_id,
                                 mp_trade_route_transport transport);
+uint32_t mp_trade_route_create_with_id(uint32_t instance_id,
+                                        uint8_t origin_player_id, int origin_city_id,
+                                        uint8_t dest_player_id, int dest_city_id,
+                                        int claudius_route_id, uint32_t network_route_id,
+                                        mp_trade_route_transport transport);
 
 /* Delete / disable / enable */
 int mp_trade_route_delete(uint32_t instance_id);
@@ -115,6 +120,8 @@ void mp_trade_route_foreach_active(mp_trade_route_callback cb, void *userdata);
 /* ---- Resource policy ---- */
 int mp_trade_route_set_resource_export(uint32_t instance_id, int resource, int enabled, int limit);
 int mp_trade_route_set_resource_import(uint32_t instance_id, int resource, int enabled, int limit);
+int mp_trade_route_set_resource_export_limit(uint32_t instance_id, int resource, int limit);
+int mp_trade_route_set_resource_import_limit(uint32_t instance_id, int resource, int limit);
 int mp_trade_route_can_export(uint32_t instance_id, int resource);
 int mp_trade_route_can_import(uint32_t instance_id, int resource);
 int mp_trade_route_export_remaining(uint32_t instance_id, int resource);

@@ -7,6 +7,13 @@
 
 #include <string.h>
 
+#ifdef ENABLE_MULTIPLAYER
+#include "multiplayer/empire_sync.h"
+#include "multiplayer/mp_trade_route.h"
+#include "multiplayer/ownership.h"
+#include "network/session.h"
+#endif
+
 typedef struct {
     int limit[RESOURCE_MAX];
     int traded[RESOURCE_MAX];
@@ -52,6 +59,215 @@ int trade_route_count(void)
 int trade_route_is_valid(int route_id)
 {
     return route_id >= 0 && (unsigned int) route_id < routes.size;
+}
+
+int empire_city_get_primary_legacy_route_id(int city_id)
+{
+    if (city_id < 0) {
+        return -1;
+    }
+    return empire_city_get_route_id(city_id);
+}
+
+static void clear_route_view(trade_route_view *out)
+{
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        out->route_id = -1;
+        out->counterpart_city_id = -1;
+        out->local_city_id = -1;
+        out->counterpart_online = 1;
+        out->state = 0;
+    }
+}
+
+static void populate_counterpart_trade_arrays(const empire_city *counterpart, trade_route_view *out)
+{
+    for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
+        out->counterpart_sells[r] = counterpart->sells_resource[r];
+        out->counterpart_buys[r] = counterpart->buys_resource[r];
+    }
+}
+
+static void populate_legacy_trade_arrays(int route_id, trade_route_view *out)
+{
+    if (!trade_route_is_valid(route_id)) {
+        return;
+    }
+
+    for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
+        out->display_sell_limit[r] = trade_route_limit(route_id, r, 0);
+        out->display_sell_traded[r] = trade_route_traded(route_id, r, 0);
+        out->display_buy_limit[r] = trade_route_limit(route_id, r, 1);
+        out->display_buy_traded[r] = trade_route_traded(route_id, r, 1);
+        out->route_export_enabled[r] = out->display_buy_limit[r] > 0;
+        out->route_import_enabled[r] = out->display_sell_limit[r] > 0;
+        out->route_export_limit[r] = out->display_buy_limit[r];
+        out->route_import_limit[r] = out->display_sell_limit[r];
+        out->route_exported_this_year[r] = out->display_buy_traded[r];
+        out->route_imported_this_year[r] = out->display_sell_traded[r];
+    }
+}
+
+#ifdef ENABLE_MULTIPLAYER
+static int populate_mp_route_view(int local_city_id, int counterpart_city_id,
+                                  const empire_city *counterpart, trade_route_view *out)
+{
+    if (!net_session_is_active() || local_city_id < 0) {
+        return 0;
+    }
+
+    mp_trade_route_instance *mpr = mp_trade_route_find_by_endpoints(local_city_id, counterpart_city_id);
+    if (!mpr) {
+        return 0;
+    }
+
+    int local_is_origin = (mpr->origin_city_id == local_city_id);
+    out->valid = 1;
+    out->route_id = mpr->claudius_route_id;
+    out->route_key = mpr->network_route_id ? mpr->network_route_id : mpr->instance_id;
+    out->local_city_id = local_city_id;
+    out->counterpart_city_id = counterpart_city_id;
+    out->is_player_to_player = mpr->is_player_to_player;
+    out->counterpart_online = mp_ownership_is_city_online(counterpart_city_id);
+    out->transport = (int)mpr->transport;
+    out->state = (int)mp_ownership_get_route_state(mpr->claudius_route_id);
+    out->is_open = out->state != MP_ROUTE_STATE_DELETED;
+    out->is_drawable = out->state != MP_ROUTE_STATE_DELETED;
+
+    populate_counterpart_trade_arrays(counterpart, out);
+    populate_legacy_trade_arrays(mpr->claudius_route_id, out);
+
+    for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
+        const mp_trade_route_resource *resource = &mpr->resources[r];
+        if (local_is_origin) {
+            out->route_export_enabled[r] = resource->export_enabled;
+            out->route_import_enabled[r] = resource->import_enabled;
+            out->route_export_limit[r] = resource->export_limit;
+            out->route_import_limit[r] = resource->import_limit;
+            out->route_exported_this_year[r] = resource->exported_this_year;
+            out->route_imported_this_year[r] = resource->imported_this_year;
+        } else {
+            out->route_export_enabled[r] = resource->import_enabled;
+            out->route_import_enabled[r] = resource->export_enabled;
+            out->route_export_limit[r] = resource->import_limit;
+            out->route_import_limit[r] = resource->export_limit;
+            out->route_exported_this_year[r] = resource->imported_this_year;
+            out->route_imported_this_year[r] = resource->exported_this_year;
+        }
+
+        out->display_sell_limit[r] = out->route_import_limit[r];
+        out->display_sell_traded[r] = out->route_imported_this_year[r];
+        out->display_buy_limit[r] = out->route_export_limit[r];
+        out->display_buy_traded[r] = out->route_exported_this_year[r];
+    }
+
+    return 1;
+}
+
+static int populate_mp_potential_view(int local_city_id, int counterpart_city_id,
+                                      const empire_city *counterpart, trade_route_view *out)
+{
+    if (!net_session_is_active() || local_city_id < 0 ||
+        !mp_ownership_is_city_player_owned(counterpart_city_id)) {
+        return 0;
+    }
+
+    out->valid = 1;
+    out->route_id = -1;
+    out->route_key = 0;
+    out->local_city_id = local_city_id;
+    out->counterpart_city_id = counterpart_city_id;
+    out->is_player_to_player = 1;
+    out->counterpart_online = mp_ownership_is_city_online(counterpart_city_id);
+    out->transport = counterpart->is_sea_trade ? MP_TROUTE_SEA : MP_TROUTE_LAND;
+    out->state = MP_ROUTE_STATE_INACTIVE;
+    out->is_open = 0;
+    out->is_drawable = 0;
+    populate_counterpart_trade_arrays(counterpart, out);
+
+    for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
+        if (out->counterpart_sells[r]) {
+            out->display_sell_limit[r] = 40;
+        }
+        if (out->counterpart_buys[r]) {
+            out->display_buy_limit[r] = 40;
+        }
+    }
+    return 1;
+}
+#endif
+
+int trade_route_get_view_for_city_pair(int local_city_id, int counterpart_city_id, trade_route_view *out)
+{
+    clear_route_view(out);
+
+    if (!out || counterpart_city_id < 0) {
+        return 0;
+    }
+
+    const empire_city *counterpart = empire_city_get(counterpart_city_id);
+    if (!counterpart || !counterpart->in_use) {
+        return 0;
+    }
+
+#ifdef ENABLE_MULTIPLAYER
+    if (populate_mp_route_view(local_city_id, counterpart_city_id, counterpart, out)) {
+        return 1;
+    }
+#endif
+
+    if (counterpart->route_id > 0 && trade_route_is_valid(counterpart->route_id)) {
+        out->valid = 1;
+        out->route_id = counterpart->route_id;
+        out->route_key = (uint32_t)counterpart->route_id;
+        out->local_city_id = local_city_id;
+        out->counterpart_city_id = counterpart_city_id;
+        out->is_open = counterpart->is_open;
+        out->is_drawable = counterpart->is_open;
+        out->transport = counterpart->is_sea_trade;
+        populate_counterpart_trade_arrays(counterpart, out);
+        populate_legacy_trade_arrays(counterpart->route_id, out);
+        return 1;
+    }
+
+#ifdef ENABLE_MULTIPLAYER
+    if (populate_mp_potential_view(local_city_id, counterpart_city_id, counterpart, out)) {
+        return 1;
+    }
+#endif
+
+    return 0;
+}
+
+int trade_route_list_for_city(int city_id, trade_route_view *out, int max_routes)
+{
+    int count = 0;
+    if (city_id < 0 || !out || max_routes <= 0) {
+        return 0;
+    }
+
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        const int array_size = empire_city_get_array_size();
+        for (int counterpart_id = 0; counterpart_id < array_size && count < max_routes; counterpart_id++) {
+            if (counterpart_id == city_id) {
+                continue;
+            }
+            if (trade_route_get_view_for_city_pair(city_id, counterpart_id, &out[count]) &&
+                out[count].route_id >= 0) {
+                count++;
+            }
+        }
+        return count;
+    }
+#endif
+
+    const empire_city *city = empire_city_get(city_id);
+    if (city && city->route_id > 0 && trade_route_get_view_for_city_pair(-1, city_id, &out[count])) {
+        count++;
+    }
+    return count;
 }
 
 void trade_route_set(int route_id, resource_type resource, int limit, int buying)

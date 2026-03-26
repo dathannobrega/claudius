@@ -12,7 +12,7 @@
 #include <stdio.h>
 
 #define IDENTITY_FILENAME "mp_identity.dat"
-#define IDENTITY_WIRE_SIZE 200  /* Conservative upper bound for serialized identity */
+#define IDENTITY_WIRE_SIZE 224  /* Conservative upper bound for serialized identity */
 
 static mp_client_identity identity;
 static int identity_loaded;
@@ -31,13 +31,16 @@ static const char *get_identity_path(void)
 void mp_client_identity_init(void)
 {
     memset(&identity, 0, sizeof(identity));
+    identity.slot_id = 0xFF;
     identity_loaded = 0;
 }
 
 void mp_client_identity_set(const uint8_t *uuid, const uint8_t *token,
+                             uint8_t slot_id,
                              const uint8_t *world_uuid,
                              const char *host_address, uint16_t host_port,
-                             const char *player_name, uint32_t session_id)
+                             const char *player_name, uint32_t session_id,
+                             uint32_t resume_generation)
 {
     identity.magic = MP_CLIENT_IDENTITY_MAGIC;
     identity.version = MP_CLIENT_IDENTITY_VERSION;
@@ -48,6 +51,7 @@ void mp_client_identity_set(const uint8_t *uuid, const uint8_t *token,
     if (token) {
         memcpy(identity.reconnect_token, token, 16);
     }
+    identity.slot_id = slot_id;
     if (world_uuid) {
         memcpy(identity.world_instance_uuid, world_uuid, MP_WORLD_UUID_SIZE);
     }
@@ -61,6 +65,7 @@ void mp_client_identity_set(const uint8_t *uuid, const uint8_t *token,
         identity.player_name[sizeof(identity.player_name) - 1] = '\0';
     }
     identity.last_session_id = session_id;
+    identity.resume_generation = resume_generation;
     identity_loaded = 1;
 }
 
@@ -80,11 +85,13 @@ int mp_client_identity_save(void)
     net_write_u32(&s, identity.version);
     net_write_raw(&s, identity.player_uuid, 16);
     net_write_raw(&s, identity.reconnect_token, 16);
+    net_write_u8(&s, identity.slot_id);
     net_write_raw(&s, identity.world_instance_uuid, MP_WORLD_UUID_SIZE);
     net_write_string(&s, identity.last_host_address, sizeof(identity.last_host_address));
     net_write_u16(&s, identity.last_host_port);
     net_write_string(&s, identity.player_name, sizeof(identity.player_name));
     net_write_u32(&s, identity.last_session_id);
+    net_write_u32(&s, identity.resume_generation);
 
     if (net_serializer_has_overflow(&s)) {
         MP_LOG_ERROR("IDENTITY", "Serialization overflow");
@@ -151,11 +158,23 @@ int mp_client_identity_load(void)
     identity.version = version;
     net_read_raw(&s, identity.player_uuid, 16);
     net_read_raw(&s, identity.reconnect_token, 16);
-    net_read_raw(&s, identity.world_instance_uuid, MP_WORLD_UUID_SIZE);
-    net_read_string(&s, identity.last_host_address, sizeof(identity.last_host_address));
-    identity.last_host_port = net_read_u16(&s);
-    net_read_string(&s, identity.player_name, sizeof(identity.player_name));
-    identity.last_session_id = net_read_u32(&s);
+    if (version >= 2) {
+        identity.slot_id = net_read_u8(&s);
+        net_read_raw(&s, identity.world_instance_uuid, MP_WORLD_UUID_SIZE);
+        net_read_string(&s, identity.last_host_address, sizeof(identity.last_host_address));
+        identity.last_host_port = net_read_u16(&s);
+        net_read_string(&s, identity.player_name, sizeof(identity.player_name));
+        identity.last_session_id = net_read_u32(&s);
+        identity.resume_generation = net_read_u32(&s);
+    } else {
+        identity.slot_id = 0xFF;
+        net_read_raw(&s, identity.world_instance_uuid, MP_WORLD_UUID_SIZE);
+        net_read_string(&s, identity.last_host_address, sizeof(identity.last_host_address));
+        identity.last_host_port = net_read_u16(&s);
+        net_read_string(&s, identity.player_name, sizeof(identity.player_name));
+        identity.last_session_id = net_read_u32(&s);
+        identity.resume_generation = 0;
+    }
 
     if (net_serializer_has_overflow(&s)) {
         MP_LOG_WARN("IDENTITY", "Identity file truncated");
@@ -176,6 +195,7 @@ void mp_client_identity_clear(void)
         remove(path);
     }
     memset(&identity, 0, sizeof(identity));
+    identity.slot_id = 0xFF;
     identity_loaded = 0;
     MP_LOG_INFO("IDENTITY", "Identity cleared");
 }

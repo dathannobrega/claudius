@@ -309,12 +309,14 @@ void mp_trade_sync_broadcast_route_state(int route_id)
         return;
     }
 
-    uint8_t buf[512];
+    mp_trade_route_instance *mpr = mp_trade_route_find_by_claudius_route(route_id);
+    uint8_t buf[768];
     net_serializer s;
     net_serializer_init(&s, buf, sizeof(buf));
     net_write_u16(&s, NET_EVENT_TRADE_POLICY_CHANGED);
     net_write_u32(&s, net_session_get_authoritative_tick());
     net_write_i32(&s, route_id);
+    net_write_u32(&s, mpr ? mpr->instance_id : 0);
 
     /* Write full route state */
     for (int r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
@@ -322,6 +324,21 @@ void mp_trade_sync_broadcast_route_state(int route_id)
         net_write_i32(&s, trade_route_traded(route_id, r, 0));   /* buy traded */
         net_write_i32(&s, trade_route_limit(route_id, r, 1));   /* sell limit */
         net_write_i32(&s, trade_route_traded(route_id, r, 1));   /* sell traded */
+        if (mpr) {
+            net_write_u8(&s, mpr->resources[r].export_enabled);
+            net_write_u8(&s, mpr->resources[r].import_enabled);
+            net_write_i32(&s, mpr->resources[r].export_limit);
+            net_write_i32(&s, mpr->resources[r].import_limit);
+            net_write_i32(&s, mpr->resources[r].exported_this_year);
+            net_write_i32(&s, mpr->resources[r].imported_this_year);
+        } else {
+            net_write_u8(&s, 0);
+            net_write_u8(&s, 0);
+            net_write_i32(&s, 0);
+            net_write_i32(&s, 0);
+            net_write_i32(&s, 0);
+            net_write_i32(&s, 0);
+        }
     }
 
     net_session_broadcast(NET_MSG_HOST_EVENT, buf, (uint32_t)net_serializer_position(&s));
@@ -520,16 +537,32 @@ void mp_trade_sync_handle_event(uint16_t event_type,
         }
         case NET_EVENT_TRADE_POLICY_CHANGED: {
             int route_id = net_read_i32(&s);
+            uint32_t route_instance_id = net_read_u32(&s);
+            mp_trade_route_instance *mpr = mp_trade_route_get(route_instance_id);
             if (trade_route_is_valid(route_id)) {
                 for (int r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
                     int buy_limit = net_read_i32(&s);
                     int buy_traded = net_read_i32(&s);
                     int sell_limit = net_read_i32(&s);
                     int sell_traded = net_read_i32(&s);
+                    uint8_t export_enabled = net_read_u8(&s);
+                    uint8_t import_enabled = net_read_u8(&s);
+                    int export_limit = net_read_i32(&s);
+                    int import_limit = net_read_i32(&s);
+                    int exported_this_year = net_read_i32(&s);
+                    int imported_this_year = net_read_i32(&s);
                     trade_route_set_limit(route_id, r, buy_limit, 0);
                     trade_route_set_limit(route_id, r, sell_limit, 1);
                     (void)buy_traded;
                     (void)sell_traded;
+                    if (mpr) {
+                        mpr->resources[r].export_enabled = export_enabled;
+                        mpr->resources[r].import_enabled = import_enabled;
+                        mpr->resources[r].export_limit = export_limit;
+                        mpr->resources[r].import_limit = import_limit;
+                        mpr->resources[r].exported_this_year = exported_this_year;
+                        mpr->resources[r].imported_this_year = imported_this_year;
+                    }
                 }
             }
             break;

@@ -46,6 +46,7 @@ void mp_command_bus_process_pending(uint32_t current_tick);
  */
 mp_command_status mp_command_bus_get_last_status(void);
 uint8_t mp_command_bus_get_last_reject_reason(void);
+const char *mp_command_bus_reject_reason_text(uint8_t reason);
 
 /**
  * Get/set the next sequence ID (for save/restore).

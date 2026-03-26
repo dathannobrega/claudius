@@ -66,7 +66,6 @@ static struct {
     int route_id;
     int route_exists;
     mp_route_state route_state;
-    int prefer_sea;
     int remote_online;
 
     /* Remote city trade settings */
@@ -356,12 +355,6 @@ static void draw_foreground(void)
             text_draw_centered(translation_for(TR_MP_P2P_TRADE_CREATE_ROUTE),
                 btn_x, bottom_y + 5, 200, FONT_NORMAL_BLACK, 0);
 
-            /* Sea/Land toggle */
-            int tog_x = btn_x + 210;
-            button_border_draw(tog_x, bottom_y, 60, 26, data.focus_button_id == 2);
-            translation_key sea_land = data.prefer_sea ? TR_MP_P2P_TRADE_SEA_PREF : TR_MP_P2P_TRADE_LAND_PREF;
-            text_draw_centered(translation_for(sea_land),
-                tog_x, bottom_y + 5, 60, FONT_NORMAL_BLACK, 0);
         } else if (!data.remote_online) {
             text_draw_centered(translation_for(TR_MP_P2P_TRADE_CITY_OFFLINE),
                 cx + 160, bottom_y + 5, DIALOG_W - 176, FONT_NORMAL_RED, 0);
@@ -432,20 +425,8 @@ static void handle_input(const mouse *m, const hotkeys *h)
                 cmd.player_id = net_session_get_local_player_id();
                 cmd.data.create_route.origin_city_id = data.local_city_id;
                 cmd.data.create_route.dest_city_id = data.remote_city_id;
-                cmd.data.create_route.prefer_sea = data.prefer_sea;
+                cmd.data.create_route.transport_mode = MP_CMD_ROUTE_TRANSPORT_AUTO;
                 mp_command_bus_submit(&cmd);
-                window_invalidate();
-                return;
-            }
-        }
-
-        /* Sea/Land toggle */
-        int tog_x = btn_x + 210;
-        if (m_dialog->x >= tog_x && m_dialog->x < tog_x + 60 &&
-            m_dialog->y >= btn_y && m_dialog->y < btn_y + 26) {
-            data.focus_button_id = 2;
-            if (m_dialog->left.went_up) {
-                data.prefer_sea = !data.prefer_sea;
                 window_invalidate();
                 return;
             }

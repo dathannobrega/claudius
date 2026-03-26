@@ -22,9 +22,14 @@
 #include "window/empire.h"
 
 #ifdef ENABLE_MULTIPLAYER
+#include "multiplayer/command_bus.h"
+#include "multiplayer/mp_trade_route.h"
+#include "multiplayer/ownership.h"
 #include "multiplayer/trade_policy.h"
 #include "network/session.h"
 #endif
+
+#include <string.h>
 
 static void button_help(int param1, int param2);
 static void button_ok(int param1, int param2);
@@ -58,14 +63,85 @@ static generic_button resource_generic_buttons[] = {
 
 static struct {
     resource_type resource;
+    int route_id;
     unsigned int focus_button_id;
     unsigned int focus_image_button_id;
 } data;
 
-static void init(resource_type resource)
+static void init(resource_type resource, int route_id)
 {
     data.resource = resource;
+    data.route_id = route_id;
 }
+
+#ifdef ENABLE_MULTIPLAYER
+static mp_trade_route_instance *current_mp_route(void)
+{
+    if (!net_session_is_active() || data.route_id <= 0) {
+        return 0;
+    }
+    return mp_trade_route_find_by_claudius_route(data.route_id);
+}
+
+static int local_city_is_route_origin(const mp_trade_route_instance *route)
+{
+    int local_city_id = mp_ownership_find_local_city();
+    return route && local_city_id >= 0 && route->origin_city_id == local_city_id;
+}
+
+static int route_import_enabled(void)
+{
+    mp_trade_route_instance *route = current_mp_route();
+    if (!route) {
+        return 0;
+    }
+    if (local_city_is_route_origin(route)) {
+        return route->resources[data.resource].import_enabled;
+    }
+    return route->resources[data.resource].export_enabled;
+}
+
+static int route_export_enabled(void)
+{
+    mp_trade_route_instance *route = current_mp_route();
+    if (!route) {
+        return 0;
+    }
+    if (local_city_is_route_origin(route)) {
+        return route->resources[data.resource].export_enabled;
+    }
+    return route->resources[data.resource].import_enabled;
+}
+
+static int route_import_limit(void)
+{
+    mp_trade_route_instance *route = current_mp_route();
+    if (!route) {
+        return 0;
+    }
+    if (local_city_is_route_origin(route)) {
+        return route->resources[data.resource].import_limit;
+    }
+    return route->resources[data.resource].export_limit;
+}
+
+static int route_export_limit(void)
+{
+    mp_trade_route_instance *route = current_mp_route();
+    if (!route) {
+        return 0;
+    }
+    if (local_city_is_route_origin(route)) {
+        return route->resources[data.resource].export_limit;
+    }
+    return route->resources[data.resource].import_limit;
+}
+
+static int using_route_context(void)
+{
+    return current_mp_route() != 0;
+}
+#endif
 
 static void draw_background(void)
 {
@@ -144,11 +220,31 @@ static void draw_foreground(void)
         int can_export_potentially = empire_can_export_resource_potentially(data.resource);
         int trade_flags = TRADE_STATUS_NONE;
         int trade_status = city_resource_trade_status(data.resource);
-        if (empire_can_import_resource(data.resource)) {
-            trade_flags |= TRADE_STATUS_IMPORT;
+#ifdef ENABLE_MULTIPLAYER
+        if (using_route_context()) {
+            can_import_potentially = 1;
+            can_export_potentially = 1;
+            trade_status = TRADE_STATUS_NONE;
+            if (route_import_enabled()) {
+                trade_status |= TRADE_STATUS_IMPORT;
+                trade_flags |= TRADE_STATUS_IMPORT;
+            }
+            if (route_export_enabled()) {
+                trade_status |= TRADE_STATUS_EXPORT;
+                trade_flags |= TRADE_STATUS_EXPORT;
+            }
         }
-        if (empire_can_export_resource(data.resource)) {
-            trade_flags |= TRADE_STATUS_EXPORT;
+#endif
+#ifdef ENABLE_MULTIPLAYER
+        if (!using_route_context())
+#endif
+        {
+            if (empire_can_import_resource(data.resource)) {
+                trade_flags |= TRADE_STATUS_IMPORT;
+            }
+            if (empire_can_export_resource(data.resource)) {
+                trade_flags |= TRADE_STATUS_EXPORT;
+            }
         }
         if (trade_flags & TRADE_STATUS_IMPORT) {
             button_border_draw(30, 212, 286, 30, data.focus_button_id == 2);
@@ -156,6 +252,11 @@ static void draw_foreground(void)
                 int x_offset = 32 + (215 - lang_text_get_width(54, 5, FONT_NORMAL_BLACK)) / 2;
                 width = lang_text_draw(54, 5, x_offset, 221, FONT_NORMAL_BLACK);
                 int trade_quantity = city_resource_import_over(data.resource);
+#ifdef ENABLE_MULTIPLAYER
+                if (using_route_context()) {
+                    trade_quantity = route_import_limit();
+                }
+#endif
                 if (trade_quantity == 0) {
                     text_draw(translation_for(TR_ADVISOR_TRADE_NO_LIMIT), x_offset + width, 221, FONT_NORMAL_BLACK, 0);
                 } else {
@@ -179,6 +280,11 @@ static void draw_foreground(void)
                 int x_offset = 324 + (220 - lang_text_get_width(54, 6, FONT_NORMAL_BLACK)) / 2;
                 width = lang_text_draw(54, 6, x_offset, 221, FONT_NORMAL_BLACK);
                 int trade_quantity = city_resource_export_over(data.resource);
+#ifdef ENABLE_MULTIPLAYER
+                if (using_route_context()) {
+                    trade_quantity = route_export_limit();
+                }
+#endif
                 text_draw_number(trade_quantity, 0, " ", x_offset + width, 221, FONT_NORMAL_BLACK, 0);
                 arrow_buttons_draw(0, 0, export_amount_arrow_buttons, 2);
             } else {
@@ -226,6 +332,9 @@ static int needs_to_open_trade_route(int status)
 #ifdef ENABLE_MULTIPLAYER
     /* In multiplayer, all storable resources are freely tradeable between players */
     if (net_session_is_active()) {
+        if (using_route_context()) {
+            return 0;
+        }
         return 0;
     }
 #endif
@@ -278,6 +387,30 @@ static void button_ok(int param1, int param2)
 
 static void button_trade_up_down(int trade_type, int is_down)
 {
+#ifdef ENABLE_MULTIPLAYER
+    if (using_route_context()) {
+        mp_command cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.command_type = MP_CMD_SET_ROUTE_LIMIT;
+        cmd.player_id = net_session_get_local_player_id();
+        cmd.data.route_limit.route_id = data.route_id;
+        cmd.data.route_limit.resource = data.resource;
+        cmd.data.route_limit.is_buying = (trade_type == TRADE_STATUS_IMPORT) ? 1 : 0;
+        cmd.data.route_limit.amount = ((trade_type == TRADE_STATUS_IMPORT) ? route_import_limit() : route_export_limit())
+                                    + (is_down ? -1 : 1);
+        if (cmd.data.route_limit.amount < 0) {
+            cmd.data.route_limit.amount = 0;
+        }
+        {
+            mp_trade_route_instance *route = current_mp_route();
+            if (route) {
+                cmd.data.route_limit.network_route_id = route->network_route_id;
+            }
+        }
+        mp_command_bus_submit(&cmd);
+        return;
+    }
+#endif
     if (trade_type == TRADE_STATUS_IMPORT) {
         city_resource_change_import_over(data.resource, is_down ? -1 : 1);
     } else if (trade_type == TRADE_STATUS_EXPORT) {
@@ -315,6 +448,30 @@ static void button_toggle_trade(const generic_button *button)
         window_empire_show();
         return;
     }
+
+#ifdef ENABLE_MULTIPLAYER
+    if (using_route_context()) {
+        mp_command cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.command_type = MP_CMD_SET_ROUTE_POLICY;
+        cmd.player_id = net_session_get_local_player_id();
+        cmd.data.route_policy.route_id = data.route_id;
+        cmd.data.route_policy.resource = data.resource;
+        cmd.data.route_policy.is_export = (status == TRADE_STATUS_EXPORT) ? 1 : 0;
+        cmd.data.route_policy.enabled = (status == TRADE_STATUS_EXPORT)
+            ? !route_export_enabled()
+            : !route_import_enabled();
+        {
+            mp_trade_route_instance *route = current_mp_route();
+            if (route) {
+                cmd.data.route_policy.network_route_id = route->network_route_id;
+            }
+        }
+        mp_command_bus_submit(&cmd);
+        return;
+    }
+#endif
+
     city_resource_cycle_trade_status(data.resource, status);
 
 #ifdef ENABLE_MULTIPLAYER
@@ -364,6 +521,11 @@ static void get_tooltip(tooltip_context *c)
 
 void window_resource_settings_show(resource_type resource)
 {
+    window_resource_settings_show_for_route(resource, -1);
+}
+
+void window_resource_settings_show_for_route(resource_type resource, int route_id)
+{
     window_type window = {
         WINDOW_RESOURCE_SETTINGS,
         draw_background,
@@ -371,6 +533,6 @@ void window_resource_settings_show(resource_type resource)
         handle_input,
         get_tooltip
     };
-    init(resource);
+    init(resource, route_id);
     window_show(&window);
 }

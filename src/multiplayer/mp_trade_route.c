@@ -36,10 +36,11 @@ static mp_trade_route_instance *alloc_route(void)
     return 0;
 }
 
-uint32_t mp_trade_route_create(uint8_t origin_player_id, int origin_city_id,
-                                uint8_t dest_player_id, int dest_city_id,
-                                int claudius_route_id, uint32_t network_route_id,
-                                mp_trade_route_transport transport)
+static uint32_t create_route_internal(uint32_t requested_instance_id,
+                                      uint8_t origin_player_id, int origin_city_id,
+                                      uint8_t dest_player_id, int dest_city_id,
+                                      int claudius_route_id, uint32_t network_route_id,
+                                      mp_trade_route_transport transport)
 {
     mp_trade_route_instance *r = alloc_route();
     if (!r) {
@@ -49,7 +50,10 @@ uint32_t mp_trade_route_create(uint8_t origin_player_id, int origin_city_id,
 
     memset(r, 0, sizeof(*r));
     r->in_use = 1;
-    r->instance_id = route_data.next_instance_id++;
+    r->instance_id = requested_instance_id ? requested_instance_id : route_data.next_instance_id++;
+    if (r->instance_id >= route_data.next_instance_id) {
+        route_data.next_instance_id = r->instance_id + 1;
+    }
     r->network_route_id = network_route_id;
     r->origin_player_id = origin_player_id;
     r->origin_city_id = origin_city_id;
@@ -61,7 +65,6 @@ uint32_t mp_trade_route_create(uint8_t origin_player_id, int origin_city_id,
     r->status = MP_TROUTE_ACTIVE;
     r->state_version = 1;
 
-    /* Initialize all resources as disabled by default */
     for (int res = 0; res < RESOURCE_MAX; res++) {
         r->resources[res].export_enabled = 0;
         r->resources[res].import_enabled = 0;
@@ -70,10 +73,32 @@ uint32_t mp_trade_route_create(uint8_t origin_player_id, int origin_city_id,
     }
 
     route_data.count++;
-    MP_LOG_INFO("MP_TRADE_ROUTE", "Created route #%u: player %d city %d -> player %d city %d (aug_route=%d)",
+    MP_LOG_INFO("MP_TRADE_ROUTE",
+                "Created route #%u: player %d city %d -> player %d city %d (aug_route=%d)",
                 r->instance_id, origin_player_id, origin_city_id,
                 dest_player_id, dest_city_id, claudius_route_id);
     return r->instance_id;
+}
+
+uint32_t mp_trade_route_create(uint8_t origin_player_id, int origin_city_id,
+                                uint8_t dest_player_id, int dest_city_id,
+                                int claudius_route_id, uint32_t network_route_id,
+                                mp_trade_route_transport transport)
+{
+    return create_route_internal(0, origin_player_id, origin_city_id,
+                                 dest_player_id, dest_city_id,
+                                 claudius_route_id, network_route_id, transport);
+}
+
+uint32_t mp_trade_route_create_with_id(uint32_t instance_id,
+                                        uint8_t origin_player_id, int origin_city_id,
+                                        uint8_t dest_player_id, int dest_city_id,
+                                        int claudius_route_id, uint32_t network_route_id,
+                                        mp_trade_route_transport transport)
+{
+    return create_route_internal(instance_id, origin_player_id, origin_city_id,
+                                 dest_player_id, dest_city_id,
+                                 claudius_route_id, network_route_id, transport);
 }
 
 int mp_trade_route_delete(uint32_t instance_id)
@@ -208,6 +233,28 @@ int mp_trade_route_set_resource_import(uint32_t instance_id, int resource, int e
         return 0;
     }
     r->resources[resource].import_enabled = enabled ? 1 : 0;
+    r->resources[resource].import_limit = limit;
+    r->state_version++;
+    return 1;
+}
+
+int mp_trade_route_set_resource_export_limit(uint32_t instance_id, int resource, int limit)
+{
+    mp_trade_route_instance *r = mp_trade_route_get(instance_id);
+    if (!r || resource < RESOURCE_MIN || resource >= RESOURCE_MAX || limit < 0) {
+        return 0;
+    }
+    r->resources[resource].export_limit = limit;
+    r->state_version++;
+    return 1;
+}
+
+int mp_trade_route_set_resource_import_limit(uint32_t instance_id, int resource, int limit)
+{
+    mp_trade_route_instance *r = mp_trade_route_get(instance_id);
+    if (!r || resource < RESOURCE_MIN || resource >= RESOURCE_MAX || limit < 0) {
+        return 0;
+    }
     r->resources[resource].import_limit = limit;
     r->state_version++;
     return 1;
