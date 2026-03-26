@@ -36,6 +36,7 @@ void mp_save_transfer_reset(void);
 
 /* Host API */
 int mp_save_transfer_host_begin(const char *save_path);
+int mp_save_transfer_host_begin_for_peer(const char *save_path, int peer_index);
 int mp_save_transfer_host_update(void);   /* Returns 1 if still in progress */
 int mp_save_transfer_host_is_complete(void);
 

@@ -18,6 +18,7 @@
 #include "network/peer.h"
 #include "network/session.h"
 #include "translation/translation.h"
+#include "window/multiplayer_window_flow.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -44,6 +45,7 @@ static void button_resume(const generic_button *button);
 static void button_leave(const generic_button *button);
 static void draw_player_item(const list_box_item *item);
 static void select_player(unsigned int index, int is_double_click);
+static void on_return(window_id from);
 
 static generic_button buttons[] = {
     {RESUME_BUTTON_X, RESUME_BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, button_resume, 0, 0},
@@ -138,9 +140,8 @@ static void button_resume(const generic_button *button)
 
 static void button_leave(const generic_button *button)
 {
-    net_session_disconnect();
-    net_session_clear_join_status();
-    window_go_back();
+    window_multiplayer_exit_to_menu();
+    (void)button;
 }
 
 static void draw_background(void)
@@ -210,7 +211,7 @@ static void handle_input(const mouse *m, const hotkeys *h)
         return;
     }
     if (state == NET_SESSION_IDLE) {
-        window_go_back();
+        window_multiplayer_exit_to_menu();
         return;
     }
 
@@ -229,6 +230,12 @@ static void handle_input(const mouse *m, const hotkeys *h)
     list_box_request_refresh(&player_list);
 }
 
+static void on_return(window_id from)
+{
+    window_invalidate();
+    (void)from;
+}
+
 void window_multiplayer_resume_lobby_show(void)
 {
     memset(&data, 0, sizeof(data));
@@ -242,7 +249,7 @@ void window_multiplayer_resume_lobby_show(void)
         draw_foreground,
         handle_input,
         0,
-        0
+        on_return
     };
     window_show(&window);
 }

@@ -15,6 +15,7 @@
 static struct {
     window_type window_queue[MAX_QUEUE];
     int queue_index;
+    int queue_count;
     window_type *current_window;
     int refresh_immediate;
     int refresh_on_draw;
@@ -82,7 +83,15 @@ window_id window_get_id(void)
 void window_show(const window_type *window)
 {
     reset_input();
-    increase_queue_index();
+    if (data.queue_count == 0) {
+        data.queue_index = 0;
+        data.queue_count = 1;
+    } else {
+        increase_queue_index();
+        if (data.queue_count < MAX_QUEUE) {
+            data.queue_count++;
+        }
+    }
     data.window_queue[data.queue_index] = *window;
     data.current_window = &data.window_queue[data.queue_index];
     if (!data.current_window->draw_background) {
@@ -102,12 +111,52 @@ void window_show(const window_type *window)
 
 void window_go_back(void)
 {
+    if (data.queue_count <= 1) {
+        return;
+    }
     reset_input();
     window_id from_id = window_get_id();
     decrease_queue_index();
+    data.queue_count--;
     data.current_window = &data.window_queue[data.queue_index];
     data.current_window->on_return(from_id);
     window_invalidate();
+}
+
+int window_go_back_to(window_id id)
+{
+    if (data.queue_count <= 1) {
+        return 0;
+    }
+
+    int target_steps = -1;
+    int probe_index = data.queue_index;
+    for (int step = 1; step < data.queue_count; step++) {
+        probe_index--;
+        if (probe_index < 0) {
+            probe_index = MAX_QUEUE - 1;
+        }
+        if (data.window_queue[probe_index].id == id) {
+            target_steps = step;
+            break;
+        }
+    }
+
+    if (target_steps < 0) {
+        return 0;
+    }
+
+    reset_input();
+    window_id from_id = window_get_id();
+    while (target_steps-- > 0) {
+        decrease_queue_index();
+        data.queue_count--;
+    }
+
+    data.current_window = &data.window_queue[data.queue_index];
+    data.current_window->on_return(from_id);
+    window_invalidate();
+    return 1;
 }
 
 static void update_input_before(void)

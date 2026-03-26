@@ -92,6 +92,7 @@ mp_player *mp_player_registry_get_host(void);
 mp_player *mp_player_registry_get_by_uuid(const uint8_t *uuid);
 mp_player *mp_player_registry_get_by_slot(uint8_t slot_id);
 int mp_player_registry_get_count(void);
+void mp_player_registry_mark_local_player(uint8_t player_id);
 
 /* Setters */
 void mp_player_registry_set_status(uint8_t player_id, mp_player_status status);

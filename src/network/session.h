@@ -100,6 +100,8 @@ void net_session_advance_tick(void);
 int net_session_send_to_host(uint16_t message_type, const uint8_t *payload, uint32_t size);
 int net_session_send_to_peer(int peer_index, uint16_t message_type,
                              const uint8_t *payload, uint32_t size);
+int net_session_broadcast_lobby(uint16_t message_type, const uint8_t *payload, uint32_t size);
+int net_session_broadcast_in_game(uint16_t message_type, const uint8_t *payload, uint32_t size);
 int net_session_broadcast(uint16_t message_type, const uint8_t *payload, uint32_t size);
 
 /* Ready state */

@@ -20,6 +20,7 @@
 #include "translation/translation.h"
 #include "widget/input_box.h"
 #include "window/multiplayer_lobby.h"
+#include "window/multiplayer_window_flow.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,7 @@ static void button_back(const generic_button *button);
 static void draw_server_item(const list_box_item *item);
 static void select_server(unsigned int index, int is_double_click);
 static void on_input_changed(int is_addition_at_end);
+static void on_return(window_id from);
 
 static generic_button buttons[] = {
     {CONNECT_BUTTON_X, CONNECT_BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, button_connect, 0, 0},
@@ -156,12 +158,8 @@ static void button_connect(const generic_button *button)
 static void button_back(const generic_button *button)
 {
     input_box_stop(&address_input);
-    net_discovery_stop_listening();
-    if (data.is_connecting) {
-        net_session_disconnect();
-        data.is_connecting = 0;
-    }
-    window_go_back();
+    window_multiplayer_exit_to_menu();
+    (void)button;
 }
 
 
@@ -366,6 +364,19 @@ static void handle_input(const mouse *m, const hotkeys *h)
     list_box_request_refresh(&server_list);
 }
 
+static void on_return(window_id from)
+{
+    data.is_connecting = 0;
+    data.reject_reason = 0;
+    data.timed_out = 0;
+    net_session_clear_join_status();
+    net_discovery_clear_hosts();
+    net_discovery_start_listening();
+    input_box_start(&address_input);
+    window_invalidate();
+    (void)from;
+}
+
 void window_multiplayer_connect_show(void)
 {
     memset(&data, 0, sizeof(data));
@@ -380,7 +391,7 @@ void window_multiplayer_connect_show(void)
         draw_foreground,
         handle_input,
         0,
-        0
+        on_return
     };
     window_show(&window);
     input_box_start(&address_input);

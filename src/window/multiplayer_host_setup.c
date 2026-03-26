@@ -18,8 +18,10 @@
 #include "multiplayer/bootstrap.h"
 #include "multiplayer/scenario_selection.h"
 #include "multiplayer/mp_debug_log.h"
+#include "network/session.h"
 #include "translation/translation.h"
 #include "window/multiplayer_lobby.h"
+#include "window/plain_message_dialog.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -46,6 +48,7 @@ static void button_continue(const generic_button *button);
 static void button_back(const generic_button *button);
 static void draw_scenario_item(const list_box_item *item);
 static void select_scenario(unsigned int index, int is_double_click);
+static void on_return(window_id from);
 
 static generic_button buttons[] = {
     {CONTINUE_BUTTON_X, CONTINUE_BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, button_continue, 0, 0},
@@ -153,8 +156,15 @@ static void button_continue(const generic_button *button)
     MP_LOG_INFO("UI", "Host setup: proceeding to lobby with scenario '%s'",
                 data.selected_filename);
 
-    /* Scenario validation will happen at game start time (in bootstrap)
-     * when we know the actual player count. Proceed to lobby. */
+    if (!net_session_is_active()) {
+        net_session_init();
+    }
+    if (!net_session_host(net_session_get_local_name(), NET_DEFAULT_PORT)) {
+        window_plain_message_dialog_show(
+            TR_MP_MENU_HOST_FAILED, TR_MP_MENU_HOST_FAILED, 0);
+        return;
+    }
+
     window_multiplayer_lobby_show();
 }
 
@@ -233,6 +243,12 @@ static void handle_input(const mouse *m, const hotkeys *h)
     }
 }
 
+static void on_return(window_id from)
+{
+    window_invalidate();
+    (void)from;
+}
+
 void window_multiplayer_host_setup_show(void)
 {
     memset(&data, 0, sizeof(data));
@@ -245,7 +261,7 @@ void window_multiplayer_host_setup_show(void)
         draw_foreground,
         handle_input,
         0,
-        0
+        on_return
     };
     window_show(&window);
 }

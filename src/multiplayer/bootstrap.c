@@ -46,6 +46,13 @@ static struct {
     char scenario_name[MP_MANIFEST_SCENARIO_NAME_MAX];
     char save_filename[MP_MANIFEST_SCENARIO_NAME_MAX];
     int is_resume;
+    struct {
+        int active;
+        int transfer_in_progress;
+        int awaiting_load_complete;
+        uint8_t peer_index;
+        uint8_t player_id;
+    } late_join;
 } boot_data;
 
 void mp_bootstrap_init(void)
@@ -57,9 +64,11 @@ void mp_bootstrap_init(void)
 
 void mp_bootstrap_reset(void)
 {
-    boot_data.state = MP_BOOT_IDLE;
-    memset(boot_data.scenario_name, 0, sizeof(boot_data.scenario_name));
+    memset(&boot_data, 0, sizeof(boot_data));
     mp_game_manifest_clear();
+    mp_join_transaction_init();
+    mp_worldgen_clear();
+    mp_save_transfer_reset();
     scenario_empire_set_multiplayer_mode(0);
     mp_autosave_reset();
 }
@@ -92,6 +101,8 @@ static uint32_t generate_session_seed(void)
     srand((unsigned int)time(NULL));
     return (uint32_t)rand() ^ ((uint32_t)rand() << 16);
 }
+
+static void finalize_late_join_transfer(void);
 
 static int load_scenario_locally(const char *scenario_name)
 {
@@ -197,11 +208,27 @@ static void broadcast_spawn_table(void)
     net_write_u32(&es, spawn_size);
     net_write_raw(&es, spawn_buf, spawn_size);
 
-    net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
-                          (uint32_t)net_serializer_position(&es));
+    net_session_broadcast_in_game(NET_MSG_HOST_EVENT, event_buf,
+                                  (uint32_t)net_serializer_position(&es));
 
     MP_LOG_INFO("BOOT", "Spawn table broadcast: %u bytes, %d spawns",
                 spawn_size, (int)mp_worldgen_get_spawn_table()->spawn_count);
+}
+
+static void broadcast_join_barrier_event(uint16_t event_type, uint8_t player_id)
+{
+    if (!net_session_is_host() || !net_session_is_in_game()) {
+        return;
+    }
+
+    uint8_t event_buf[16];
+    net_serializer es;
+    net_serializer_init(&es, event_buf, sizeof(event_buf));
+    net_write_u16(&es, event_type);
+    net_write_u32(&es, mp_time_sync_get_authoritative_tick());
+    net_write_u8(&es, player_id);
+    net_session_broadcast_in_game(NET_MSG_HOST_EVENT, event_buf,
+                                  (uint32_t)net_serializer_position(&es));
 }
 
 int mp_bootstrap_host_start_game(void)
@@ -240,26 +267,7 @@ int mp_bootstrap_host_start_game(void)
     /* Store seed in spawn table for worldgen */
     mp_worldgen_get_spawn_table_mutable()->session_seed = seed;
 
-    /* 2. Send GAME_PREPARE (manifest) to all peers */
-    {
-        uint8_t manifest_buf[256];
-        uint32_t manifest_size = 0;
-        mp_game_manifest_serialize(manifest_buf, &manifest_size);
-
-        /* We need to broadcast to peers in JOINED/READY state, not just IN_GAME.
-         * Use send_to_peer directly since broadcast only sends to IN_GAME peers. */
-        for (int i = 0; i < NET_MAX_PEERS; i++) {
-            const net_peer *peer = net_session_get_peer(i);
-            if (peer && peer->active) {
-                net_session_send_to_peer(i, NET_MSG_GAME_PREPARE,
-                                         manifest_buf, manifest_size);
-            }
-        }
-
-        MP_LOG_INFO("BOOT", "GAME_PREPARE sent to %d peers", player_count - 1);
-    }
-
-    /* 3. Load scenario locally */
+    /* 2. Load and validate locally before telling clients to prepare anything */
     if (!load_scenario_locally(boot_data.scenario_name)) {
         MP_LOG_ERROR("BOOT", "Host failed to load scenario — aborting game start");
         boot_data.state = MP_BOOT_SCENARIO_SELECTED;
@@ -298,31 +306,47 @@ int mp_bootstrap_host_start_game(void)
     /* 6. Apply spawns to empire (create city ownership records) */
     mp_worldgen_apply_spawns();
 
-    /* 7. Transition session to in-game state (sets peers to IN_GAME) */
+    /* 7. Only after local preparation succeeds, ask clients to prepare too */
+    {
+        uint8_t manifest_buf[256];
+        uint32_t manifest_size = 0;
+        mp_game_manifest_serialize(manifest_buf, &manifest_size);
+
+        for (int i = 0; i < NET_MAX_PEERS; i++) {
+            const net_peer *peer = net_session_get_peer(i);
+            if (peer && peer->active) {
+                net_session_send_to_peer(i, NET_MSG_GAME_PREPARE,
+                                         manifest_buf, manifest_size);
+            }
+        }
+
+        MP_LOG_INFO("BOOT", "GAME_PREPARE sent to %d peers", player_count - 1);
+    }
+
+    /* 8. Transition session to in-game state (sets peers to IN_GAME) */
     net_session_transition_to_game();
 
-    /* 8. Broadcast spawn table to clients (must be AFTER start_game
-     *    because broadcast only sends to PEER_STATE_IN_GAME peers) */
+    /* 9. Broadcast spawn table to clients */
     broadcast_spawn_table();
 
-    /* 9. Send GAME_START_FINAL to all peers (they are now IN_GAME) */
+    /* 10. Send GAME_START_FINAL to all peers */
     {
         uint8_t start_buf[8];
         net_serializer ss;
         net_serializer_init(&ss, start_buf, sizeof(start_buf));
         net_write_u32(&ss, 0); /* start tick */
         net_write_u8(&ss, 2);  /* normal speed */
-        net_session_broadcast(NET_MSG_GAME_START_FINAL, start_buf,
-                              (uint32_t)net_serializer_position(&ss));
+        net_session_broadcast_in_game(NET_MSG_GAME_START_FINAL, start_buf,
+                                      (uint32_t)net_serializer_position(&ss));
     }
 
-    /* 9b. Send initial full snapshot so clients have authoritative MP state */
+    /* 11. Send initial full snapshot so clients have authoritative MP state */
     {
         uint8_t *snap_buf = (uint8_t *)malloc(MP_SNAPSHOT_MAX_SIZE);
         if (snap_buf) {
             uint32_t snap_size = 0;
             if (mp_snapshot_build_full(snap_buf, MP_SNAPSHOT_MAX_SIZE, &snap_size)) {
-                net_session_broadcast(NET_MSG_FULL_SNAPSHOT, snap_buf, snap_size);
+                net_session_broadcast_in_game(NET_MSG_FULL_SNAPSHOT, snap_buf, snap_size);
                 MP_LOG_INFO("BOOT", "Initial snapshot broadcast: %u bytes", snap_size);
             }
             free(snap_buf);
@@ -701,6 +725,14 @@ void mp_bootstrap_update(void)
         }
         /* Transfer complete — finalize the resume */
         mp_bootstrap_host_finalize_resume();
+        return;
+    }
+
+    if (net_session_is_host() && boot_data.late_join.transfer_in_progress) {
+        if (mp_save_transfer_host_update()) {
+            return;
+        }
+        finalize_late_join_transfer();
     }
 }
 
@@ -744,11 +776,68 @@ void mp_bootstrap_client_save_transfer_complete(void)
     MP_LOG_INFO("BOOT", "Client save loaded successfully — waiting for snapshot + GAME_START_FINAL");
 }
 
+static void finalize_late_join_transfer(void)
+{
+    uint8_t peer_index = boot_data.late_join.peer_index;
+
+    {
+        uint8_t *snap_buf = (uint8_t *)malloc(MP_SNAPSHOT_MAX_SIZE);
+        if (snap_buf) {
+            uint32_t snap_size = 0;
+            if (mp_snapshot_build_full(snap_buf, MP_SNAPSHOT_MAX_SIZE, &snap_size)) {
+                net_session_send_to_peer(peer_index, NET_MSG_FULL_SNAPSHOT,
+                                         snap_buf, snap_size);
+            }
+            free(snap_buf);
+        }
+    }
+
+    {
+        uint8_t start_buf[8];
+        net_serializer ss;
+        net_serializer_init(&ss, start_buf, sizeof(start_buf));
+        net_write_u32(&ss, mp_time_sync_get_authoritative_tick());
+        net_write_u8(&ss, mp_time_sync_get_speed());
+        net_session_send_to_peer(peer_index, NET_MSG_GAME_START_FINAL,
+                                 start_buf, (uint32_t)net_serializer_position(&ss));
+    }
+
+    boot_data.late_join.transfer_in_progress = 0;
+    boot_data.late_join.awaiting_load_complete = 1;
+}
+
+void mp_bootstrap_host_cancel_late_join(uint8_t peer_index)
+{
+    if (!boot_data.late_join.active || boot_data.late_join.peer_index != peer_index) {
+        return;
+    }
+
+    if (boot_data.late_join.transfer_in_progress) {
+        mp_save_transfer_reset();
+    }
+    mp_time_sync_set_join_barrier(0);
+    broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED,
+                                 boot_data.late_join.player_id);
+    memset(&boot_data.late_join, 0, sizeof(boot_data.late_join));
+}
+
+void mp_bootstrap_host_complete_late_join(uint8_t peer_index)
+{
+    if (!boot_data.late_join.active || boot_data.late_join.peer_index != peer_index) {
+        return;
+    }
+    memset(&boot_data.late_join, 0, sizeof(boot_data.late_join));
+}
+
 /* ---- Phase 6: Late join handler ---- */
 
 void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_name)
 {
     if (!net_session_is_host()) {
+        return;
+    }
+    if (boot_data.late_join.active) {
+        MP_LOG_WARN("BOOT", "Late join already in progress â€” rejecting new request");
         return;
     }
 
@@ -762,17 +851,7 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
     /* 1. Activate join barrier — pauses simulation for all players */
     mp_time_sync_set_join_barrier(1);
 
-    /* Broadcast barrier active event */
-    {
-        uint8_t event_buf[16];
-        net_serializer es;
-        net_serializer_init(&es, event_buf, sizeof(event_buf));
-        net_write_u16(&es, NET_EVENT_JOIN_BARRIER_ACTIVE);
-        net_write_u32(&es, mp_time_sync_get_authoritative_tick());
-        net_write_u8(&es, 0); /* reserved */
-        net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
-                              (uint32_t)net_serializer_position(&es));
-    }
+    broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_ACTIVE, 0);
 
     /* 2. Begin join transaction for rollback tracking */
     extern mp_join_transaction *mp_join_transaction_begin(uint8_t peer_index);
@@ -780,6 +859,7 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
     if (!txn) {
         MP_LOG_ERROR("BOOT", "Failed to create join transaction");
         mp_time_sync_set_join_barrier(0);
+        broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, 0);
         return;
     }
 
@@ -795,6 +875,7 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
     if (new_player_id == 0) {
         MP_LOG_ERROR("BOOT", "No free player ID for late join");
         mp_join_transaction_rollback(txn);
+        broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, 0);
         return;
     }
 
@@ -810,6 +891,7 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
     if (city_id < 0) {
         MP_LOG_ERROR("BOOT", "No reserved city available for late join");
         mp_join_transaction_rollback(txn);
+        broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, 0);
         return;
     }
     txn->assigned_city_id = city_id;
@@ -883,59 +965,35 @@ void mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_n
                                  manifest_buf, manifest_size);
     }
 
-    /* 10. Create save checkpoint and start transfer to joining peer.
-     *     For now we use broadcast which sends to all IN_GAME peers.
-     *     The joining peer is in LOADING state, so we send directly. */
+    /* 10. Create a checkpoint and start an async save transfer scoped to the joining peer */
     {
         const char *checkpoint_path = mp_safe_file_get_save_path("mp_latejoin_checkpoint.sav");
-        if (game_file_write_saved_game(checkpoint_path)) {
-            mp_save_transfer_init();
-            mp_save_transfer_host_begin(checkpoint_path);
+        if (!game_file_write_saved_game(checkpoint_path)) {
+            MP_LOG_ERROR("BOOT", "Failed to write late join checkpoint");
+            mp_join_transaction_rollback(txn);
+            mp_time_sync_set_join_barrier(0);
+            broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, new_player_id);
+            return;
+        }
+
+        mp_save_transfer_init();
+        if (!mp_save_transfer_host_begin_for_peer(checkpoint_path, peer_index)) {
+            MP_LOG_ERROR("BOOT", "Failed to start peer-scoped late join transfer");
             platform_file_manager_remove_file(checkpoint_path);
-
-            /* Drive the transfer to completion synchronously for late join.
-             * This blocks for a short time but ensures atomic delivery. */
-            while (mp_save_transfer_host_update()) {
-                /* Continue sending chunks */
-            }
+            mp_join_transaction_rollback(txn);
+            mp_time_sync_set_join_barrier(0);
+            broadcast_join_barrier_event(NET_EVENT_JOIN_BARRIER_RELEASED, new_player_id);
+            return;
         }
+
+        platform_file_manager_remove_file(checkpoint_path);
     }
 
-    /* 11. Send snapshot with latest MP state */
-    {
-        uint8_t *snap_buf = (uint8_t *)malloc(MP_SNAPSHOT_MAX_SIZE);
-        if (snap_buf) {
-            uint32_t snap_size = 0;
-            if (mp_snapshot_build_full(snap_buf, MP_SNAPSHOT_MAX_SIZE, &snap_size)) {
-                net_session_send_to_peer(peer_index, NET_MSG_FULL_SNAPSHOT,
-                                         snap_buf, snap_size);
-            }
-            free(snap_buf);
-        }
-    }
-
-    /* 12. Send GAME_START_FINAL */
-    {
-        uint8_t start_buf[8];
-        net_serializer ss;
-        net_serializer_init(&ss, start_buf, sizeof(start_buf));
-        net_write_u32(&ss, mp_time_sync_get_authoritative_tick());
-        net_write_u8(&ss, mp_time_sync_get_speed());
-        net_session_send_to_peer(peer_index, NET_MSG_GAME_START_FINAL,
-                                 start_buf, (uint32_t)net_serializer_position(&ss));
-    }
-
-    /* Broadcast player joined event */
-    {
-        uint8_t event_buf[32];
-        net_serializer es;
-        net_serializer_init(&es, event_buf, sizeof(event_buf));
-        net_write_u16(&es, NET_EVENT_PLAYER_JOINED);
-        net_write_u32(&es, mp_time_sync_get_authoritative_tick());
-        net_write_u8(&es, new_player_id);
-        net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
-                              (uint32_t)net_serializer_position(&es));
-    }
+    boot_data.late_join.active = 1;
+    boot_data.late_join.transfer_in_progress = 1;
+    boot_data.late_join.awaiting_load_complete = 0;
+    boot_data.late_join.peer_index = peer_index;
+    boot_data.late_join.player_id = new_player_id;
 
     /* Transaction start time for timeout tracking */
     txn->start_ms = net_tcp_get_timestamp_ms();

@@ -763,6 +763,7 @@ if(ENABLE_MULTIPLAYER)
         ${PROJECT_SOURCE_DIR}/src/window/multiplayer_chat.c
         ${PROJECT_SOURCE_DIR}/src/window/multiplayer_p2p_trade.c
         ${PROJECT_SOURCE_DIR}/src/window/multiplayer_resume_lobby.c
+        ${PROJECT_SOURCE_DIR}/src/window/multiplayer_window_flow.c
     )
 endif()
 

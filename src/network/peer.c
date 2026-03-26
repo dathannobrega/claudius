@@ -89,6 +89,7 @@ static const char *PEER_STATE_NAMES[] = {
     "HELLO_SENT",
     "JOINED",
     "READY",
+    "LOADING",
     "IN_GAME",
     "DESYNCED",
     "DISCONNECTING"

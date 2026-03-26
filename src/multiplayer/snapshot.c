@@ -207,12 +207,16 @@ uint32_t mp_snapshot_get_last_tick(void)
 
 void multiplayer_snapshot_receive_full(const uint8_t *data, uint32_t size)
 {
-    mp_snapshot_apply_full(data, size);
+    if (mp_snapshot_apply_full(data, size)) {
+        mp_player_registry_mark_local_player(net_session_get_local_player_id());
+    }
 }
 
 void multiplayer_snapshot_receive_delta(const uint8_t *data, uint32_t size)
 {
-    mp_snapshot_apply_delta(data, size);
+    if (mp_snapshot_apply_delta(data, size)) {
+        mp_player_registry_mark_local_player(net_session_get_local_player_id());
+    }
 }
 
 #endif /* ENABLE_MULTIPLAYER */

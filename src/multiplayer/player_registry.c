@@ -212,6 +212,14 @@ int mp_player_registry_get_count(void)
     return registry.count;
 }
 
+void mp_player_registry_mark_local_player(uint8_t player_id)
+{
+    for (int i = 0; i < MP_MAX_PLAYERS; i++) {
+        registry.players[i].is_local = registry.players[i].active &&
+            registry.players[i].player_id == player_id;
+    }
+}
+
 /* ---- Setters ---- */
 
 void mp_player_registry_set_status(uint8_t player_id, mp_player_status status)

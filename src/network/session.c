@@ -6,12 +6,14 @@
 #include "transport_udp.h"
 #include "serialize.h"
 #include "discovery_lan.h"
+#include "multiplayer/bootstrap.h"
 #include "multiplayer/player_registry.h"
 #include "multiplayer/ownership.h"
 #include "multiplayer/empire_sync.h"
 #include "multiplayer/time_sync.h"
 #include "multiplayer/worldgen.h"
 #include "multiplayer/save_transfer.h"
+#include "multiplayer/snapshot.h"
 #include "multiplayer/join_transaction.h"
 #include "multiplayer/client_identity.h"
 #include "multiplayer/game_manifest.h"
@@ -84,55 +86,121 @@ static void close_peer(int index)
     session.peer_count--;
 }
 
+static int peer_accepts_lobby_message(const net_peer *peer)
+{
+    if (!peer || !peer->active) {
+        return 0;
+    }
+    return peer->state == PEER_STATE_JOINED ||
+           peer->state == PEER_STATE_READY ||
+           peer->state == PEER_STATE_LOADING ||
+           peer->state == PEER_STATE_IN_GAME;
+}
+
+static int peer_accepts_in_game_message(const net_peer *peer)
+{
+    return peer && peer->active && peer->state == PEER_STATE_IN_GAME;
+}
+
+static void apply_lobby_snapshot(const uint8_t *payload, uint32_t size)
+{
+    mp_player_registry_deserialize(payload, size);
+    mp_player_registry_mark_local_player(session.local_player_id);
+}
+
+static void broadcast_lobby_snapshot(void)
+{
+    uint8_t snapshot_buf[8192];
+    uint32_t snapshot_size = 0;
+    mp_player_registry_serialize(snapshot_buf, &snapshot_size);
+    net_session_broadcast_lobby(NET_MSG_LOBBY_SNAPSHOT, snapshot_buf, snapshot_size);
+}
+
+static void broadcast_full_snapshot_to_in_game_peers(void)
+{
+    uint8_t *snap_buf = (uint8_t *)malloc(MP_SNAPSHOT_MAX_SIZE);
+    if (!snap_buf) {
+        return;
+    }
+
+    {
+        uint32_t snap_size = 0;
+        if (mp_snapshot_build_full(snap_buf, MP_SNAPSHOT_MAX_SIZE, &snap_size)) {
+            net_session_broadcast_in_game(NET_MSG_FULL_SNAPSHOT, snap_buf, snap_size);
+        }
+    }
+
+    free(snap_buf);
+}
+
 static void handle_peer_disconnect(int peer_index)
 {
     net_peer *peer = &session.peers[peer_index];
+    uint8_t player_id;
+    char player_name[NET_MAX_PLAYER_NAME];
     if (!peer->active) {
         return;
     }
+    strncpy(player_name, peer->name, sizeof(player_name) - 1);
+    player_name[sizeof(player_name) - 1] = '\0';
 
     /* Phase 7: Check for incomplete join transaction and roll back */
     {
         mp_join_transaction *txn = mp_join_transaction_find_by_peer((uint8_t)peer_index);
+        extern void mp_bootstrap_host_cancel_late_join(uint8_t peer_index);
         if (txn && txn->active) {
             MP_LOG_INFO("SESSION", "Peer %d disconnected during join — rolling back transaction",
                         peer_index);
+            mp_bootstrap_host_cancel_late_join((uint8_t)peer_index);
             mp_join_transaction_rollback(txn);
             close_peer(peer_index);
             return;
         }
     }
 
-    uint8_t player_id = peer->player_id;
-
-    /* Mark player as disconnected in registry */
+    player_id = peer->player_id;
     mp_player *player = mp_player_registry_get(player_id);
     if (player && player->active) {
-        uint32_t timeout_ticks = 3000; /* ~5 minutes at normal speed */
-        mp_player_registry_mark_disconnected(player_id,
-            session.authoritative_tick, timeout_ticks);
+        if (session.state == NET_SESSION_HOSTING_LOBBY) {
+            extern int mp_bootstrap_is_resume(void);
+            if (mp_bootstrap_is_resume()) {
+                uint32_t timeout_ticks = 3000;
+                mp_player_registry_mark_disconnected(player_id,
+                    session.authoritative_tick, timeout_ticks);
+                mp_ownership_set_player_routes_offline(player_id);
+                mp_empire_sync_unregister_player_city(player_id);
+                if (player->assigned_city_id >= 0) {
+                    mp_ownership_set_city_online(player->assigned_city_id, 0);
+                }
+            } else {
+                mp_player_registry_remove(player_id);
+            }
+        } else {
+            mp_player_registry_mark_disconnected(player_id,
+                session.authoritative_tick, 3000);
+            mp_ownership_set_player_routes_offline(player_id);
+            mp_empire_sync_unregister_player_city(player_id);
+            if (player->assigned_city_id >= 0) {
+                mp_ownership_set_city_online(player->assigned_city_id, 0);
+            }
+        }
+    }
 
-        /* Set all routes involving this player to offline */
-        mp_ownership_set_player_routes_offline(player_id);
+    close_peer(peer_index);
 
-        /* Mark city offline in empire sync */
-        mp_empire_sync_unregister_player_city(player_id);
-        mp_ownership_set_city_online(player->assigned_city_id, 0);
-
-        /* Broadcast player disconnected event to remaining peers */
+    if (session.state == NET_SESSION_HOSTING_LOBBY) {
+        broadcast_lobby_snapshot();
+    } else {
         uint8_t event_buf[32];
         net_serializer es;
         net_serializer_init(&es, event_buf, sizeof(event_buf));
         net_write_u16(&es, NET_EVENT_PLAYER_LEFT);
         net_write_u32(&es, session.authoritative_tick);
         net_write_u8(&es, player_id);
-        net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
-                              (uint32_t)net_serializer_position(&es));
-
-        log_info("Player disconnected, city frozen", peer->name, (int)player_id);
+        net_session_broadcast_in_game(NET_MSG_HOST_EVENT, event_buf,
+                                      (uint32_t)net_serializer_position(&es));
+        log_info("Player disconnected, city frozen", player_name, (int)player_id);
     }
-
-    close_peer(peer_index);
 }
 
 static void send_raw_to_peer(net_peer *peer, uint16_t message_type,
@@ -223,15 +291,16 @@ static int try_reconnect_player(net_peer *peer, const uint8_t *uuid,
     send_raw_to_peer(peer, NET_MSG_JOIN_ACCEPT, accept_buf,
                      (uint32_t)net_serializer_position(&as));
 
-    /* Broadcast reconnect event */
-    uint8_t event_buf[32];
-    net_serializer es;
-    net_serializer_init(&es, event_buf, sizeof(event_buf));
-    net_write_u16(&es, NET_EVENT_PLAYER_RECONNECTED);
-    net_write_u32(&es, session.authoritative_tick);
-    net_write_u8(&es, old_player_id);
-    net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
-                          (uint32_t)net_serializer_position(&es));
+    {
+        uint8_t event_buf[32];
+        net_serializer es;
+        net_serializer_init(&es, event_buf, sizeof(event_buf));
+        net_write_u16(&es, NET_EVENT_PLAYER_RECONNECTED);
+        net_write_u32(&es, session.authoritative_tick);
+        net_write_u8(&es, old_player_id);
+        net_session_broadcast_in_game(NET_MSG_HOST_EVENT, event_buf,
+                                      (uint32_t)net_serializer_position(&es));
+    }
 
     /* Send full snapshot to reconnecting player so they can resync */
     extern void multiplayer_resync_handle_request(uint8_t player_id);
@@ -385,15 +454,7 @@ static void handle_hello(net_peer *peer, const uint8_t *payload, uint32_t size)
                         send_raw_to_peer(peer, NET_MSG_JOIN_ACCEPT, accept_buf,
                                          (uint32_t)net_serializer_position(&as));
 
-                        /* Broadcast reconnect event */
-                        uint8_t event_buf[32];
-                        net_serializer es;
-                        net_serializer_init(&es, event_buf, sizeof(event_buf));
-                        net_write_u16(&es, NET_EVENT_PLAYER_RECONNECTED);
-                        net_write_u32(&es, session.authoritative_tick);
-                        net_write_u8(&es, old_player_id);
-                        net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
-                                              (uint32_t)net_serializer_position(&es));
+                        broadcast_lobby_snapshot();
                         return;
                     }
                 }
@@ -534,16 +595,7 @@ static void handle_hello(net_peer *peer, const uint8_t *payload, uint32_t size)
     MP_LOG_INFO("HANDSHAKE", "JOIN_ACCEPT sent: player_id=%d slot=%d session=0x%08x seed=%u",
                 (int)new_player_id, slot, session.session_id, session_seed);
 
-    /* Broadcast player joined event to other peers */
-    uint8_t event_buf[64];
-    net_serializer es;
-    net_serializer_init(&es, event_buf, sizeof(event_buf));
-    net_write_u16(&es, NET_EVENT_PLAYER_JOINED);
-    net_write_u32(&es, session.authoritative_tick);
-    net_write_u8(&es, new_player_id);
-    net_write_raw(&es, name, NET_MAX_PLAYER_NAME);
-    net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
-                          (uint32_t)net_serializer_position(&es));
+    broadcast_lobby_snapshot();
 }
 
 static void handle_chat_from_client(net_peer *peer, const uint8_t *payload, uint32_t size)
@@ -565,9 +617,13 @@ static void handle_chat_from_client(net_peer *peer, const uint8_t *payload, uint
     net_read_string(&rs, message, sizeof(message));
     net_write_string(&s, message, sizeof(message));
 
-    /* Broadcast to all peers (including sender for confirmation) */
-    net_session_broadcast(NET_MSG_CHAT, relay_buf,
-                          (uint32_t)net_serializer_position(&s));
+    if (net_session_is_in_lobby()) {
+        net_session_broadcast_lobby(NET_MSG_CHAT, relay_buf,
+                                    (uint32_t)net_serializer_position(&s));
+    } else {
+        net_session_broadcast_in_game(NET_MSG_CHAT, relay_buf,
+                                      (uint32_t)net_serializer_position(&s));
+    }
 
     /* Also store in host's chat history */
     mp_chat_entry *entry = &chat_history.entries[chat_history.write_index];
@@ -615,6 +671,7 @@ static void handle_client_message(net_peer *peer, const net_packet_header *heade
                 mp_player_registry_set_status(peer->player_id,
                     ready ? MP_PLAYER_READY : MP_PLAYER_LOBBY);
                 log_info("Player ready state changed", peer->name, ready);
+                broadcast_lobby_snapshot();
             }
             break;
         }
@@ -683,6 +740,8 @@ static void handle_client_message(net_peer *peer, const net_packet_header *heade
                     mp_join_transaction_commit(txn);
                 }
 
+                broadcast_full_snapshot_to_in_game_peers();
+
                 /* Release join barrier */
                 mp_time_sync_set_join_barrier(0);
 
@@ -693,8 +752,11 @@ static void handle_client_message(net_peer *peer, const net_packet_header *heade
                 net_write_u16(&es, NET_EVENT_JOIN_BARRIER_RELEASED);
                 net_write_u32(&es, session.authoritative_tick);
                 net_write_u8(&es, peer->player_id);
-                net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
-                                      (uint32_t)net_serializer_position(&es));
+                net_session_broadcast_in_game(NET_MSG_HOST_EVENT, event_buf,
+                                              (uint32_t)net_serializer_position(&es));
+
+                extern void mp_bootstrap_host_complete_late_join(uint8_t peer_index);
+                mp_bootstrap_host_complete_late_join((uint8_t)(peer - session.peers));
 
                 MP_LOG_INFO("BOOT", "Join barrier released: player %d fully loaded",
                             (int)peer->player_id);
@@ -791,7 +853,7 @@ static void handle_host_message(const net_packet_header *header,
                         join_correlation_id, (int)session.local_player_id, (int)slot_id,
                         session.session_id, session_seed, (int)player_count);
 
-            /* Register self in player registry with assigned UUID */
+            mp_player_registry_clear();
             mp_player_registry_add_with_uuid(session.local_player_id,
                 session.local_player_name, assigned_uuid, 1, 0);
             mp_player *self = mp_player_registry_get(session.local_player_id);
@@ -820,6 +882,10 @@ static void handle_host_message(const net_packet_header *header,
 
             log_info("Joined session as player", 0, session.local_player_id);
             (void)player_count;
+            break;
+        }
+        case NET_MSG_LOBBY_SNAPSHOT: {
+            apply_lobby_snapshot(payload, size);
             break;
         }
         case NET_MSG_JOIN_REJECT: {
@@ -910,13 +976,14 @@ static void handle_host_message(const net_packet_header *header,
         case NET_MSG_GAME_PREPARE: {
             extern int mp_bootstrap_client_prepare(const uint8_t *payload, uint32_t size);
             if (mp_bootstrap_client_prepare(payload, size)) {
-                /* Notify host that we loaded successfully */
-                uint8_t ack_buf[1];
-                net_serializer ls;
-                net_serializer_init(&ls, ack_buf, sizeof(ack_buf));
-                net_write_u8(&ls, session.local_player_id);
-                net_session_send_to_host(NET_MSG_GAME_LOAD_COMPLETE,
-                                         ack_buf, (uint32_t)net_serializer_position(&ls));
+                if (mp_bootstrap_get_state() != MP_BOOT_SAVE_TRANSFER) {
+                    uint8_t ack_buf[1];
+                    net_serializer ls;
+                    net_serializer_init(&ls, ack_buf, sizeof(ack_buf));
+                    net_write_u8(&ls, session.local_player_id);
+                    net_session_send_to_host(NET_MSG_GAME_LOAD_COMPLETE,
+                                             ack_buf, (uint32_t)net_serializer_position(&ls));
+                }
             } else {
                 MP_LOG_ERROR("BOOT", "Failed to prepare game — disconnecting");
                 session.state = NET_SESSION_DISCONNECTING;
@@ -955,6 +1022,14 @@ static void handle_host_message(const net_packet_header *header,
             extern void mp_bootstrap_client_save_transfer_complete(void);
             if (mp_save_transfer_get_state() == MP_TRANSFER_COMPLETE) {
                 mp_bootstrap_client_save_transfer_complete();
+                if (mp_bootstrap_get_state() == MP_BOOT_LOADED) {
+                    uint8_t ack_buf[1];
+                    net_serializer ls;
+                    net_serializer_init(&ls, ack_buf, sizeof(ack_buf));
+                    net_write_u8(&ls, session.local_player_id);
+                    net_session_send_to_host(NET_MSG_GAME_LOAD_COMPLETE,
+                                             ack_buf, (uint32_t)net_serializer_position(&ls));
+                }
             }
             break;
         }
@@ -1127,6 +1202,10 @@ int net_session_init(void)
 {
     memset(&session, 0, sizeof(net_session));
     memset(&chat_history, 0, sizeof(chat_history));
+    mp_player_registry_clear();
+    join_status = NET_JOIN_STATUS_NONE;
+    join_reject_reason = 0;
+    join_start_ms = 0;
     session.listen_fd = -1;
     session.udp_fd = -1;
 
@@ -1228,6 +1307,9 @@ void net_session_kick_peer(uint8_t player_id)
             mp_player_registry_remove(player_id);
 
             close_peer(i);
+            if (session.state == NET_SESSION_HOSTING_LOBBY) {
+                broadcast_lobby_snapshot();
+            }
             break;
         }
     }
@@ -1247,6 +1329,7 @@ int net_session_join(const char *player_name, const char *host_address, uint16_t
 
     session.role = NET_ROLE_CLIENT;
     session.state = NET_SESSION_JOINING;
+    mp_player_registry_clear();
 
     strncpy(session.local_player_name, player_name, NET_MAX_PLAYER_NAME - 1);
     session.local_player_name[NET_MAX_PLAYER_NAME - 1] = '\0';
@@ -1372,6 +1455,11 @@ void net_session_disconnect(void)
     session.state = NET_SESSION_IDLE;
     session.role = NET_ROLE_NONE;
     session.peer_count = 0;
+    join_status = NET_JOIN_STATUS_NONE;
+    join_reject_reason = 0;
+    join_start_ms = 0;
+    memset(&chat_history, 0, sizeof(chat_history));
+    mp_player_registry_clear();
 
     /* Clear persisted client identity on explicit disconnect */
     mp_client_identity_clear();
@@ -1573,19 +1661,36 @@ int net_session_send_to_peer(int peer_index, uint16_t message_type,
     return 1;
 }
 
-int net_session_broadcast(uint16_t message_type, const uint8_t *payload, uint32_t size)
+static int broadcast_with_filter(uint16_t message_type, const uint8_t *payload,
+                                 uint32_t size, int (*filter)(const net_peer *peer))
 {
     if (session.role != NET_ROLE_HOST) {
         return 0;
     }
+
     int sent_count = 0;
     for (int i = 0; i < NET_MAX_PEERS; i++) {
-        if (session.peers[i].active && session.peers[i].state == PEER_STATE_IN_GAME) {
+        if (filter(&session.peers[i])) {
             send_raw_to_peer(&session.peers[i], message_type, payload, size);
             sent_count++;
         }
     }
     return sent_count;
+}
+
+int net_session_broadcast_lobby(uint16_t message_type, const uint8_t *payload, uint32_t size)
+{
+    return broadcast_with_filter(message_type, payload, size, peer_accepts_lobby_message);
+}
+
+int net_session_broadcast_in_game(uint16_t message_type, const uint8_t *payload, uint32_t size)
+{
+    return broadcast_with_filter(message_type, payload, size, peer_accepts_in_game_message);
+}
+
+int net_session_broadcast(uint16_t message_type, const uint8_t *payload, uint32_t size)
+{
+    return net_session_broadcast_in_game(message_type, payload, size);
 }
 
 void net_session_set_ready(int is_ready)
@@ -1597,6 +1702,10 @@ void net_session_set_ready(int is_ready)
         net_write_u8(&s, session.local_player_id);
         net_write_u8(&s, (uint8_t)is_ready);
         net_session_send_to_host(NET_MSG_READY_STATE, buf, 2);
+    } else if (session.role == NET_ROLE_HOST) {
+        mp_player_registry_set_status(session.local_player_id,
+            is_ready ? MP_PLAYER_READY : MP_PLAYER_LOBBY);
+        broadcast_lobby_snapshot();
     }
 }
 
@@ -1605,12 +1714,19 @@ int net_session_all_peers_ready(void)
     if (session.role != NET_ROLE_HOST) {
         return 0;
     }
-    for (int i = 0; i < NET_MAX_PEERS; i++) {
-        if (session.peers[i].active && session.peers[i].state != PEER_STATE_READY) {
+
+    int ready_count = 0;
+    for (int i = 0; i < MP_MAX_PLAYERS; i++) {
+        mp_player *player = mp_player_registry_get((uint8_t)i);
+        if (!player || !player->active) {
+            continue;
+        }
+        if (player->status != MP_PLAYER_READY) {
             return 0;
         }
+        ready_count++;
     }
-    return session.peer_count > 0;
+    return ready_count > 0;
 }
 
 net_session *net_session_get(void)
@@ -1676,7 +1792,11 @@ int net_session_send_chat(const char *message)
         if (chat_history.count < MP_CHAT_HISTORY_SIZE) {
             chat_history.count++;
         }
-        net_session_broadcast(NET_MSG_CHAT, buf, (uint32_t)net_serializer_position(&s));
+        if (net_session_is_in_lobby()) {
+            net_session_broadcast_lobby(NET_MSG_CHAT, buf, (uint32_t)net_serializer_position(&s));
+        } else {
+            net_session_broadcast_in_game(NET_MSG_CHAT, buf, (uint32_t)net_serializer_position(&s));
+        }
     } else {
         /* Client: send to host for relay */
         net_session_send_to_host(NET_MSG_CHAT, buf, (uint32_t)net_serializer_position(&s));

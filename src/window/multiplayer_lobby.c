@@ -3,7 +3,6 @@
 #include "multiplayer_lobby.h"
 
 #include "core/string.h"
-#include "multiplayer/bootstrap.h"
 #include "graphics/button.h"
 #include "graphics/generic_button.h"
 #include "graphics/graphics.h"
@@ -13,45 +12,53 @@
 #include "graphics/text.h"
 #include "graphics/window.h"
 #include "input/input.h"
+#include "multiplayer/bootstrap.h"
 #include "multiplayer/player_registry.h"
 #include "network/peer.h"
 #include "network/session.h"
 #include "translation/translation.h"
+#include "window/multiplayer_window_flow.h"
 
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 
 #define PANEL_X 64
 #define PANEL_Y 32
 #define PANEL_WIDTH_BLOCKS 30
 #define PANEL_HEIGHT_BLOCKS 24
+#define PANEL_WIDTH (PANEL_WIDTH_BLOCKS * 16)
+#define PANEL_HEIGHT (PANEL_HEIGHT_BLOCKS * 16)
 
 #define LIST_X (PANEL_X + 16)
 #define LIST_Y (PANEL_Y + 64)
 #define LIST_WIDTH_BLOCKS 26
 #define LIST_HEIGHT_BLOCKS 12
 #define LIST_ITEM_HEIGHT 24
+#define LIST_WIDTH (LIST_WIDTH_BLOCKS * 16)
 
-#define READY_BUTTON_X (PANEL_X + 16)
-#define READY_BUTTON_Y (PANEL_Y + PANEL_HEIGHT_BLOCKS * 16 - 48)
-#define START_BUTTON_X (PANEL_X + 192)
-#define START_BUTTON_Y READY_BUTTON_Y
-#define LEAVE_BUTTON_X (PANEL_X + 368)
-#define LEAVE_BUTTON_Y READY_BUTTON_Y
-#define BUTTON_WIDTH 160
+#define BUTTON_ROW_Y (PANEL_Y + PANEL_HEIGHT - 48)
+#define HOST_BUTTON_WIDTH 128
+#define CLIENT_BUTTON_WIDTH 144
 #define BUTTON_HEIGHT 24
+#define BUTTON_GAP 8
+
+#define NAME_COLUMN_X (LIST_X + 8)
+#define HOST_COLUMN_X (LIST_X + 168)
+#define STATUS_COLUMN_X (LIST_X + 236)
+#define PING_COLUMN_X (LIST_X + LIST_WIDTH - 60)
 
 static void button_ready(const generic_button *button);
 static void button_start(const generic_button *button);
 static void button_leave(const generic_button *button);
 static void draw_player_item(const list_box_item *item);
 static void select_player(unsigned int index, int is_double_click);
+static void on_return(window_id from);
 
-static generic_button buttons[] = {
-    {READY_BUTTON_X, READY_BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, button_ready, 0, 0},
-    {START_BUTTON_X, START_BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, button_start, 0, 0},
-    {LEAVE_BUTTON_X, LEAVE_BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, button_leave, 0, 0},
-};
+static generic_button host_buttons[3];
+static generic_button client_buttons[2];
+
+static const uint8_t status_awaiting_text[] = "Awaiting Reconnect";
+static const uint8_t status_desynced_text[] = "Desynced";
 
 static list_box_type player_list = {
     .x = LIST_X,
@@ -69,42 +76,103 @@ static list_box_type player_list = {
 
 static struct {
     unsigned int focus_button_id;
-    int is_ready;
     int player_ids[MP_MAX_PLAYERS];
     int player_count;
 } data;
 
+static void configure_buttons(void)
+{
+    int host_row_width = HOST_BUTTON_WIDTH * 3 + BUTTON_GAP * 2;
+    int host_start_x = PANEL_X + (PANEL_WIDTH - host_row_width) / 2;
+    host_buttons[0] = (generic_button){host_start_x, BUTTON_ROW_Y,
+        HOST_BUTTON_WIDTH, BUTTON_HEIGHT, button_ready, 0, 0};
+    host_buttons[1] = (generic_button){host_start_x + HOST_BUTTON_WIDTH + BUTTON_GAP, BUTTON_ROW_Y,
+        HOST_BUTTON_WIDTH, BUTTON_HEIGHT, button_start, 0, 0};
+    host_buttons[2] = (generic_button){host_start_x + (HOST_BUTTON_WIDTH + BUTTON_GAP) * 2, BUTTON_ROW_Y,
+        HOST_BUTTON_WIDTH, BUTTON_HEIGHT, button_leave, 0, 0};
+
+    {
+        int client_row_width = CLIENT_BUTTON_WIDTH * 2 + BUTTON_GAP;
+        int client_start_x = PANEL_X + (PANEL_WIDTH - client_row_width) / 2;
+        client_buttons[0] = (generic_button){client_start_x, BUTTON_ROW_Y,
+            CLIENT_BUTTON_WIDTH, BUTTON_HEIGHT, button_ready, 0, 0};
+        client_buttons[1] = (generic_button){client_start_x + CLIENT_BUTTON_WIDTH + BUTTON_GAP, BUTTON_ROW_Y,
+            CLIENT_BUTTON_WIDTH, BUTTON_HEIGHT, button_leave, 0, 0};
+    }
+}
+
 static void refresh_player_list(void)
 {
     data.player_count = 0;
-    int id = mp_player_registry_get_first_active_id();
-    while (id >= 0 && data.player_count < MP_MAX_PLAYERS) {
+    for (int id = mp_player_registry_get_first_active_id();
+         id >= 0 && data.player_count < MP_MAX_PLAYERS;
+         id = mp_player_registry_get_next_active_id(id)) {
         data.player_ids[data.player_count++] = id;
-        id = mp_player_registry_get_next_active_id(id);
     }
     list_box_update_total_items(&player_list, data.player_count);
 }
 
-
-static translation_key status_translation(mp_player_status status)
+static int local_player_is_ready(void)
 {
-    switch (status) {
-        case MP_PLAYER_READY: return TR_MP_LOBBY_READY;
-        case MP_PLAYER_IN_GAME: return TR_MP_LOBBY_IN_GAME;
-        case MP_PLAYER_DISCONNECTED: return TR_MP_LOBBY_DISCONNECTED;
-        case MP_PLAYER_LOBBY: return TR_MP_LOBBY_NOT_READY;
-        default: return TR_MP_LOBBY_NOT_READY;
+    mp_player *local = mp_player_registry_get_local();
+    return local && local->status == MP_PLAYER_READY;
+}
+
+static const uint8_t *status_text(const mp_player *player)
+{
+    if (!player) {
+        return translation_for(TR_MP_LOBBY_NOT_READY);
+    }
+
+    switch (player->status) {
+        case MP_PLAYER_READY:
+            return translation_for(TR_MP_LOBBY_READY);
+        case MP_PLAYER_IN_GAME:
+            return translation_for(TR_MP_LOBBY_IN_GAME);
+        case MP_PLAYER_DISCONNECTED:
+            return translation_for(TR_MP_LOBBY_DISCONNECTED);
+        case MP_PLAYER_AWAITING_RECONNECT:
+            return status_awaiting_text;
+        case MP_PLAYER_DESYNCED:
+            return status_desynced_text;
+        case MP_PLAYER_LOBBY:
+        default:
+            if (player->connection_state == MP_CONNECTION_DISCONNECTED) {
+                return translation_for(TR_MP_LOBBY_DISCONNECTED);
+            }
+            return translation_for(TR_MP_LOBBY_NOT_READY);
     }
 }
 
-static font_t status_font(mp_player_status status)
+static font_t status_font(const mp_player *player)
 {
-    switch (status) {
-        case MP_PLAYER_READY: return FONT_NORMAL_GREEN;
-        case MP_PLAYER_IN_GAME: return FONT_NORMAL_GREEN;
-        case MP_PLAYER_DISCONNECTED: return FONT_NORMAL_RED;
-        default: return FONT_NORMAL_PLAIN;
+    if (!player) {
+        return FONT_NORMAL_PLAIN;
     }
+
+    switch (player->status) {
+        case MP_PLAYER_READY:
+        case MP_PLAYER_IN_GAME:
+            return FONT_NORMAL_GREEN;
+        case MP_PLAYER_AWAITING_RECONNECT:
+            return FONT_NORMAL_BROWN;
+        case MP_PLAYER_DESYNCED:
+        case MP_PLAYER_DISCONNECTED:
+            return FONT_NORMAL_RED;
+        default:
+            return FONT_NORMAL_PLAIN;
+    }
+}
+
+static const net_peer *find_player_peer(uint8_t player_id)
+{
+    for (int i = 0; i < NET_MAX_PEERS; i++) {
+        const net_peer *peer = net_session_get_peer(i);
+        if (peer && peer->active && peer->player_id == player_id) {
+            return peer;
+        }
+    }
+    return 0;
 }
 
 static void draw_player_item(const list_box_item *item)
@@ -113,46 +181,37 @@ static void draw_player_item(const list_box_item *item)
         return;
     }
 
-    int player_id = data.player_ids[item->index];
-    mp_player *player = mp_player_registry_get(player_id);
+    mp_player *player = mp_player_registry_get((uint8_t)data.player_ids[item->index]);
     if (!player || !player->active) {
         return;
     }
 
-    font_t name_font = item->is_focused ? FONT_NORMAL_WHITE : FONT_NORMAL_GREEN;
-
-    /* Player name */
-    uint8_t name_buf[64];
-    string_copy(string_from_ascii(player->name), name_buf, 64);
-    text_draw(name_buf, item->x + 8, item->y + 4, name_font, 0);
-
-    /* Host indicator */
-    if (player->is_host) {
-        const uint8_t *host_text = translation_for(TR_MP_HOST);
-        text_draw(host_text, item->x + 180, item->y + 4, FONT_NORMAL_BROWN, 0);
+    {
+        font_t name_font = item->is_focused ? FONT_NORMAL_WHITE : FONT_NORMAL_GREEN;
+        uint8_t name_buf[64];
+        string_copy(string_from_ascii(player->name), name_buf, sizeof(name_buf));
+        text_ellipsize(name_buf, name_font, HOST_COLUMN_X - NAME_COLUMN_X - 12);
+        text_draw(name_buf, NAME_COLUMN_X, item->y + 4, name_font, 0);
     }
 
-    /* Status */
-    translation_key status_key = status_translation(player->status);
-    const uint8_t *status_text_str = translation_for(status_key);
-    text_draw(status_text_str, item->x + 240, item->y + 4, status_font(player->status), 0);
+    if (player->is_host) {
+        const uint8_t *host_text = translation_for(TR_MP_HOST);
+        text_draw(host_text, HOST_COLUMN_X, item->y + 4, FONT_NORMAL_BROWN, 0);
+    }
 
-    /* Ping (for remote players) */
+    {
+        const uint8_t *player_status = status_text(player);
+        text_draw(player_status, STATUS_COLUMN_X, item->y + 4, status_font(player), 0);
+    }
+
     if (!player->is_local) {
-        const net_peer *peer = 0;
-        for (int i = 0; i < NET_MAX_PEERS; i++) {
-            const net_peer *p = net_session_get_peer(i);
-            if (p && p->active && p->player_id == player->player_id) {
-                peer = p;
-                break;
-            }
-        }
+        const net_peer *peer = find_player_peer(player->player_id);
         if (peer) {
             char ping_str[16];
-            snprintf(ping_str, sizeof(ping_str), "%u ms", peer->rtt_smoothed_ms);
             uint8_t ping_buf[16];
-            string_copy(string_from_ascii(ping_str), ping_buf, 16);
-            text_draw(ping_buf, item->x + 360, item->y + 4, FONT_NORMAL_PLAIN, 0);
+            snprintf(ping_str, sizeof(ping_str), "%u ms", peer->rtt_smoothed_ms);
+            string_copy(string_from_ascii(ping_str), ping_buf, sizeof(ping_buf));
+            text_draw(ping_buf, PING_COLUMN_X, item->y + 4, FONT_NORMAL_PLAIN, 0);
         }
     }
 
@@ -163,44 +222,43 @@ static void draw_player_item(const list_box_item *item)
 
 static void select_player(unsigned int index, int is_double_click)
 {
-    /* Selection only, no action on click */
     window_invalidate();
+    (void)index;
+    (void)is_double_click;
 }
 
 static void button_ready(const generic_button *button)
 {
-    data.is_ready = !data.is_ready;
-    net_session_set_ready(data.is_ready);
-    mp_player *local = mp_player_registry_get_local();
-    if (local) {
-        mp_player_registry_set_status(local->player_id,
-            data.is_ready ? MP_PLAYER_READY : MP_PLAYER_LOBBY);
+    int next_ready = !local_player_is_ready();
+    net_session_set_ready(next_ready);
+
+    {
+        mp_player *local = mp_player_registry_get_local();
+        if (local) {
+            mp_player_registry_set_status(local->player_id,
+                next_ready ? MP_PLAYER_READY : MP_PLAYER_LOBBY);
+        }
     }
+
     window_invalidate();
+    (void)button;
 }
 
 static void button_start(const generic_button *button)
 {
-    if (!net_session_is_host()) {
+    if (!net_session_is_host() || !net_session_all_peers_ready()) {
         return;
     }
-    if (!net_session_all_peers_ready()) {
-        return;
-    }
-    /* Use the bootstrap pipeline instead of raw net_session_transition_to_game().
-     * This loads the scenario, initializes subsystems, generates spawns,
-     * broadcasts to clients, and transitions to WINDOW_CITY. */
     if (!mp_bootstrap_host_start_game()) {
-        /* Bootstrap failed — stay in lobby */
-        return;
+        window_invalidate();
     }
+    (void)button;
 }
 
 static void button_leave(const generic_button *button)
 {
-    net_session_disconnect();
-    net_session_clear_join_status();
-    window_go_back();
+    window_multiplayer_exit_to_menu();
+    (void)button;
 }
 
 static void draw_background(void)
@@ -208,15 +266,18 @@ static void draw_background(void)
     graphics_in_dialog();
     outer_panel_draw(PANEL_X, PANEL_Y, PANEL_WIDTH_BLOCKS, PANEL_HEIGHT_BLOCKS);
 
-    /* Title */
     lang_text_draw_centered(CUSTOM_TRANSLATION, TR_MP_LOBBY_TITLE,
-        PANEL_X, PANEL_Y + 14, PANEL_WIDTH_BLOCKS * 16, FONT_LARGE_BLACK);
+        PANEL_X, PANEL_Y + 14, PANEL_WIDTH, FONT_LARGE_BLACK);
 
-    /* Column headers */
-    int header_y = LIST_Y - 18;
-    lang_text_draw(CUSTOM_TRANSLATION, TR_MP_LOBBY_PLAYERS, LIST_X + 8, header_y, FONT_NORMAL_BLACK);
-    lang_text_draw(CUSTOM_TRANSLATION, TR_MP_LOBBY_STATUS, LIST_X + 240, header_y, FONT_NORMAL_BLACK);
-    lang_text_draw(CUSTOM_TRANSLATION, TR_MP_LOBBY_PING, LIST_X + 360, header_y, FONT_NORMAL_BLACK);
+    {
+        int header_y = LIST_Y - 18;
+        lang_text_draw(CUSTOM_TRANSLATION, TR_MP_LOBBY_PLAYERS,
+            NAME_COLUMN_X, header_y, FONT_NORMAL_BLACK);
+        lang_text_draw(CUSTOM_TRANSLATION, TR_MP_LOBBY_STATUS,
+            STATUS_COLUMN_X, header_y, FONT_NORMAL_BLACK);
+        lang_text_draw(CUSTOM_TRANSLATION, TR_MP_LOBBY_PING,
+            PING_COLUMN_X, header_y, FONT_NORMAL_BLACK);
+    }
 
     graphics_reset_dialog();
 }
@@ -225,39 +286,46 @@ static void draw_foreground(void)
 {
     graphics_in_dialog();
 
-    /* Refresh player data */
     refresh_player_list();
-
-    /* Player list */
     list_box_draw(&player_list);
 
-    /* Ready button */
-    large_label_draw(READY_BUTTON_X, READY_BUTTON_Y,
-        BUTTON_WIDTH / 16, data.focus_button_id == 1 ? 1 : 0);
-    translation_key ready_key = data.is_ready ? TR_MP_LOBBY_BUTTON_NOT_READY : TR_MP_LOBBY_BUTTON_READY;
-    lang_text_draw_centered(CUSTOM_TRANSLATION, ready_key,
-        READY_BUTTON_X, READY_BUTTON_Y + 5, BUTTON_WIDTH, FONT_NORMAL_GREEN);
+    {
+        int button_count = 0;
+        generic_button *buttons = net_session_is_host() ? host_buttons : client_buttons;
+        button_count = net_session_is_host() ? 3 : 2;
 
-    /* Start button (host only) */
-    if (net_session_is_host()) {
-        int all_ready = net_session_all_peers_ready();
-        large_label_draw(START_BUTTON_X, START_BUTTON_Y,
-            BUTTON_WIDTH / 16, data.focus_button_id == 2 ? 1 : 0);
-        lang_text_draw_centered(CUSTOM_TRANSLATION, TR_MP_LOBBY_BUTTON_START,
-            START_BUTTON_X, START_BUTTON_Y + 5, BUTTON_WIDTH,
-            all_ready ? FONT_NORMAL_GREEN : FONT_NORMAL_PLAIN);
-    } else {
-        /* Show waiting message for clients */
-        const uint8_t *waiting = translation_for(TR_MP_LOBBY_WAITING_HOST);
-        text_draw_centered(waiting, START_BUTTON_X, START_BUTTON_Y + 5,
-            BUTTON_WIDTH, FONT_NORMAL_PLAIN, 0);
+        for (int i = 0; i < button_count; i++) {
+            large_label_draw(buttons[i].x, buttons[i].y, buttons[i].width / 16,
+                data.focus_button_id == (unsigned int)(i + 1));
+        }
     }
 
-    /* Leave button */
-    large_label_draw(LEAVE_BUTTON_X, LEAVE_BUTTON_Y,
-        BUTTON_WIDTH / 16, data.focus_button_id == 3 ? 1 : 0);
-    lang_text_draw_centered(CUSTOM_TRANSLATION, TR_MP_LOBBY_BUTTON_LEAVE,
-        LEAVE_BUTTON_X, LEAVE_BUTTON_Y + 5, BUTTON_WIDTH, FONT_NORMAL_GREEN);
+    {
+        translation_key ready_key = local_player_is_ready()
+            ? TR_MP_LOBBY_BUTTON_NOT_READY
+            : TR_MP_LOBBY_BUTTON_READY;
+        const generic_button *ready_button = net_session_is_host()
+            ? &host_buttons[0]
+            : &client_buttons[0];
+        lang_text_draw_centered(CUSTOM_TRANSLATION, ready_key,
+            ready_button->x, ready_button->y + 5, ready_button->width, FONT_NORMAL_GREEN);
+    }
+
+    if (net_session_is_host()) {
+        int all_ready = net_session_all_peers_ready();
+        lang_text_draw_centered(CUSTOM_TRANSLATION, TR_MP_LOBBY_BUTTON_START,
+            host_buttons[1].x, host_buttons[1].y + 5, host_buttons[1].width,
+            all_ready ? FONT_NORMAL_GREEN : FONT_NORMAL_PLAIN);
+        lang_text_draw_centered(CUSTOM_TRANSLATION, TR_MP_LOBBY_BUTTON_LEAVE,
+            host_buttons[2].x, host_buttons[2].y + 5, host_buttons[2].width, FONT_NORMAL_GREEN);
+    } else {
+        const uint8_t *waiting = translation_for(TR_MP_LOBBY_WAITING_HOST);
+        text_draw_centered(waiting, PANEL_X, BUTTON_ROW_Y - 20, PANEL_WIDTH,
+            FONT_NORMAL_PLAIN, 0);
+        lang_text_draw_centered(CUSTOM_TRANSLATION, TR_MP_LOBBY_BUTTON_LEAVE,
+            client_buttons[1].x, client_buttons[1].y + 5, client_buttons[1].width,
+            FONT_NORMAL_GREEN);
+    }
 
     graphics_reset_dialog();
 }
@@ -265,31 +333,21 @@ static void draw_foreground(void)
 static void handle_input(const mouse *m, const hotkeys *h)
 {
     const mouse *m_dialog = mouse_in_dialog(m);
-
-    /* Check session state transitions */
     net_session_state state = net_session_get_state();
+
     if (state == NET_SESSION_HOSTING_GAME || state == NET_SESSION_CLIENT_GAME) {
-        /* Game started — the game tick system will handle transitioning to WINDOW_CITY */
         return;
     }
     if (state == NET_SESSION_IDLE) {
-        /* Disconnected */
-        window_go_back();
+        window_multiplayer_exit_to_menu();
         return;
     }
 
-    int num_buttons = net_session_is_host() ? 3 : 2;
-    /* For clients, buttons are index 0 (ready) and 2 (leave), skip start */
-    if (!net_session_is_host()) {
-        /* Remap: button 0 = ready, button 2 = leave */
-        generic_button client_buttons[2];
-        client_buttons[0] = buttons[0];
-        client_buttons[1] = buttons[2];
-        if (generic_buttons_handle_mouse(m_dialog, 0, 0, client_buttons, 2, &data.focus_button_id)) {
-            return;
-        }
-    } else {
-        if (generic_buttons_handle_mouse(m_dialog, 0, 0, buttons, num_buttons, &data.focus_button_id)) {
+    {
+        generic_button *buttons = net_session_is_host() ? host_buttons : client_buttons;
+        int button_count = net_session_is_host() ? 3 : 2;
+        if (generic_buttons_handle_mouse(m_dialog, 0, 0, buttons, button_count,
+                                         &data.focus_button_id)) {
             return;
         }
     }
@@ -300,27 +358,37 @@ static void handle_input(const mouse *m, const hotkeys *h)
 
     if (input_go_back_requested(m, h)) {
         button_leave(0);
+        return;
     }
 
     list_box_request_refresh(&player_list);
 }
 
+static void on_return(window_id from)
+{
+    data.focus_button_id = 0;
+    window_invalidate();
+    (void)from;
+}
+
 void window_multiplayer_lobby_show(void)
 {
     memset(&data, 0, sizeof(data));
-
+    configure_buttons();
     refresh_player_list();
     list_box_init(&player_list, data.player_count);
 
-    window_type window = {
-        WINDOW_MULTIPLAYER_LOBBY,
-        draw_background,
-        draw_foreground,
-        handle_input,
-        0,
-        0
-    };
-    window_show(&window);
+    {
+        window_type window = {
+            WINDOW_MULTIPLAYER_LOBBY,
+            draw_background,
+            draw_foreground,
+            handle_input,
+            0,
+            on_return
+        };
+        window_show(&window);
+    }
 }
 
 #endif /* ENABLE_MULTIPLAYER */

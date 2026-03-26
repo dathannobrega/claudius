@@ -164,6 +164,8 @@ void mp_bootstrap_rebind_loaded_save(void);
  * Query whether the current bootstrap is a resume (not fresh start).
  */
 int mp_bootstrap_is_resume(void);
+void mp_bootstrap_host_cancel_late_join(uint8_t peer_index);
+void mp_bootstrap_host_complete_late_join(uint8_t peer_index);
 
 #endif /* ENABLE_MULTIPLAYER */
 
