@@ -59,6 +59,7 @@ void mp_ownership_set_city_online(int city_id, int online);
  */
 int mp_ownership_create_route(int route_id, mp_route_owner_mode mode,
                                uint8_t origin_player_id, uint8_t dest_player_id,
+                               int origin_city_id, int dest_city_id,
                                uint32_t network_route_id);
 
 void mp_ownership_delete_route(int route_id);
@@ -71,6 +72,8 @@ void mp_ownership_set_route(int route_id, mp_route_owner_mode mode,
 mp_route_owner_mode mp_ownership_get_route_mode(int route_id);
 uint8_t mp_ownership_get_route_origin_player(int route_id);
 uint8_t mp_ownership_get_route_dest_player(int route_id);
+int mp_ownership_get_route_origin_city(int route_id);
+int mp_ownership_get_route_dest_city(int route_id);
 int mp_ownership_is_route_player_to_player(int route_id);
 int mp_ownership_is_route_active(int route_id);
 

@@ -18,7 +18,7 @@
  */
 
 #define MP_CLIENT_IDENTITY_MAGIC    0x4D504944  /* "MPID" */
-#define MP_CLIENT_IDENTITY_VERSION  1
+#define MP_CLIENT_IDENTITY_VERSION  2
 #define MP_WORLD_UUID_SIZE          16
 
 typedef struct {
@@ -26,11 +26,13 @@ typedef struct {
     uint32_t version;
     uint8_t player_uuid[16];
     uint8_t reconnect_token[16];
+    uint8_t slot_id;
     uint8_t world_instance_uuid[MP_WORLD_UUID_SIZE];
     char last_host_address[64];
     uint16_t last_host_port;
     char player_name[32];
     uint32_t last_session_id;
+    uint32_t resume_generation;
 } mp_client_identity;
 
 void mp_client_identity_init(void);
@@ -68,9 +70,11 @@ int mp_client_identity_matches_world(const uint8_t *world_uuid);
  * Set identity fields from JOIN_ACCEPT data (before saving).
  */
 void mp_client_identity_set(const uint8_t *uuid, const uint8_t *token,
+                             uint8_t slot_id,
                              const uint8_t *world_uuid,
                              const char *host_address, uint16_t host_port,
-                             const char *player_name, uint32_t session_id);
+                             const char *player_name, uint32_t session_id,
+                             uint32_t resume_generation);
 
 /**
  * Get the current loaded identity (const).

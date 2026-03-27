@@ -97,6 +97,8 @@ void empire_city_set_type(int city_id, empire_city_type type);
 void empire_city_open_trade(int city_id, int apply_cost);
 
 void empire_city_generate_trader(void);
+void empire_city_refresh_trade_route_bindings(int city_id);
+void empire_city_refresh_all_trade_route_bindings(void);
 
 void empire_city_remove_trader(int city_id, int figure_id);
 

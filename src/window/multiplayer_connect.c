@@ -55,6 +55,8 @@ static void draw_server_item(const list_box_item *item);
 static void select_server(unsigned int index, int is_double_click);
 static void on_input_changed(int is_addition_at_end);
 static void on_return(window_id from);
+static const char *discovered_host_status_text(const net_discovered_host *host);
+static const char *reject_reason_text(uint8_t reason);
 
 static generic_button buttons[] = {
     {CONNECT_BUTTON_X, CONNECT_BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, button_connect, 0, 0},
@@ -99,6 +101,52 @@ static input_box address_input = {
 static void on_input_changed(int is_addition_at_end)
 {
     window_invalidate();
+}
+
+static const char *discovered_host_status_text(const net_discovered_host *host)
+{
+    if (!host) {
+        return "";
+    }
+
+    if (host->session_phase == NET_DISCOVERY_PHASE_RESUME_LOBBY) {
+        return "Resume: reconexao";
+    }
+
+    if (host->session_phase == NET_DISCOVERY_PHASE_LOBBY) {
+        return "Lobby aberto";
+    }
+
+    switch (host->join_policy) {
+        case NET_DISCOVERY_JOIN_RECONNECT_ONLY:
+            return "Jogo: reconexao";
+        case NET_DISCOVERY_JOIN_LATE_JOIN_ALLOWED:
+            return "Jogo: late join";
+        case NET_DISCOVERY_JOIN_CLOSED:
+            return "Jogo: fechado";
+        case NET_DISCOVERY_JOIN_OPEN_LOBBY:
+        default:
+            return "Jogo: aberto";
+    }
+}
+
+static const char *reject_reason_text(uint8_t reason)
+{
+    switch (reason) {
+        case NET_REJECT_VERSION_MISMATCH: return "Versao incompativel";
+        case NET_REJECT_SESSION_FULL: return "Sessao lotada";
+        case NET_REJECT_GAME_IN_PROGRESS: return "Jogo em andamento";
+        case NET_REJECT_NAME_TAKEN: return "Nome em uso";
+        case NET_REJECT_BANNED: return "Acesso bloqueado";
+        case NET_REJECT_NO_RESERVED_SLOTS: return "Sem slots reservados";
+        case NET_REJECT_LATE_JOIN_BUSY: return "Late join ocupado";
+        case NET_REJECT_RECONNECT_REQUIRED: return "Reconexao obrigatoria";
+        case NET_REJECT_SLOT_NOT_FOUND: return "Slot nao encontrado";
+        case NET_REJECT_WORLD_MISMATCH: return "Mundo divergente";
+        case NET_REJECT_RESUME_GENERATION_MISMATCH: return "Resume desatualizado";
+        case NET_REJECT_INTERNAL_ERROR: return "Erro interno do host";
+        default: return "Conexao rejeitada";
+    }
 }
 
 static void try_connect(const char *address)
@@ -185,14 +233,21 @@ static void draw_server_item(const list_box_item *item)
     /* IP address */
     uint8_t ip_buf[64];
     string_copy(string_from_ascii(host->host_ip), ip_buf, 64);
-    text_draw(ip_buf, item->x + 180, item->y + 2, FONT_NORMAL_PLAIN, 0);
+    text_draw(ip_buf, item->x + 128, item->y + 2, FONT_NORMAL_PLAIN, 0);
+
+    /* Session status */
+    {
+        uint8_t status_buf[64];
+        string_copy(string_from_ascii(discovered_host_status_text(host)), status_buf, 64);
+        text_draw(status_buf, item->x + 248, item->y + 2, FONT_NORMAL_PLAIN, 0);
+    }
 
     /* Player count */
     char count_str[16];
     snprintf(count_str, sizeof(count_str), "%d/%d", host->player_count, host->max_players);
     uint8_t count_buf[16];
     string_copy(string_from_ascii(count_str), count_buf, 16);
-    text_draw(count_buf, item->x + 350, item->y + 2, FONT_NORMAL_PLAIN, 0);
+    text_draw(count_buf, item->x + item->width - 42, item->y + 2, FONT_NORMAL_PLAIN, 0);
 
     if (item->is_focused) {
         button_border_draw(item->x, item->y, item->width, item->height, 1);
@@ -212,7 +267,15 @@ static void select_server(unsigned int index, int is_double_click)
     if (!host || !host->active) {
         return;
     }
-    try_connect(host->host_ip);
+    {
+        char address[64];
+        if (host->port != NET_DEFAULT_PORT) {
+            snprintf(address, sizeof(address), "%s:%u", host->host_ip, (unsigned int)host->port);
+        } else {
+            snprintf(address, sizeof(address), "%s", host->host_ip);
+        }
+        try_connect(address);
+    }
 }
 
 static void draw_background(void)
@@ -255,14 +318,7 @@ static void draw_foreground(void)
 
     /* Show rejection or timeout status messages */
     if (data.reject_reason) {
-        const char *reason_text = "Connection rejected";
-        switch (data.reject_reason) {
-            case NET_REJECT_VERSION_MISMATCH: reason_text = "Version mismatch"; break;
-            case NET_REJECT_SESSION_FULL: reason_text = "Session full"; break;
-            case NET_REJECT_GAME_IN_PROGRESS: reason_text = "Game in progress"; break;
-            case NET_REJECT_NAME_TAKEN: reason_text = "Name already taken"; break;
-            case NET_REJECT_BANNED: reason_text = "Banned"; break;
-        }
+        const char *reason_text = reject_reason_text(data.reject_reason);
         uint8_t reject_buf[64];
         string_copy(string_from_ascii(reason_text), reject_buf, 64);
         text_draw_centered(reject_buf, PANEL_X, INPUT_Y + 36,

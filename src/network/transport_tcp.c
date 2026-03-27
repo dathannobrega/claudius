@@ -13,7 +13,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#endif
 typedef int socklen_t;
 #define NET_WOULD_BLOCK (WSAGetLastError() == WSAEWOULDBLOCK)
 #define NET_CLOSE_SOCKET closesocket

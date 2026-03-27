@@ -9,10 +9,12 @@
 #include "player_registry.h"
 #include "trade_policy.h"
 #include "trade_sync.h"
+#include "empire_sync.h"
 #include "network/session.h"
 #include "network/serialize.h"
 #include "network/protocol.h"
 #include "building/building.h"
+#include "building/count.h"
 #include "building/storage.h"
 #include "empire/city.h"
 #include "empire/trade_route.h"
@@ -32,6 +34,92 @@ static struct {
     mp_command_status last_status;
     uint8_t last_reject_reason;
 } bus;
+
+static int local_city_has_sea_access(void)
+{
+    return building_count_active(BUILDING_DOCK) > 0;
+}
+
+static int city_supports_land_trade(int city_id)
+{
+    const empire_city *city = empire_city_get(city_id);
+    if (!city || !city->in_use) {
+        return 0;
+    }
+
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active() && mp_ownership_is_city_remote_player(city_id)) {
+        const mp_city_trade_view *view = mp_empire_sync_get_trade_view(city_id);
+        if (view) {
+            return view->land_route_available;
+        }
+    }
+#endif
+
+    return !city->is_sea_trade;
+}
+
+static int city_supports_sea_trade(int city_id)
+{
+    const empire_city *city = empire_city_get(city_id);
+    if (!city || !city->in_use) {
+        return 0;
+    }
+
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active() && mp_ownership_is_city_remote_player(city_id)) {
+        const mp_city_trade_view *view = mp_empire_sync_get_trade_view(city_id);
+        if (view) {
+            return view->dock_available && local_city_has_sea_access();
+        }
+    }
+#endif
+
+    if (!city->is_sea_trade) {
+        return 0;
+    }
+    return local_city_has_sea_access();
+}
+
+static int resolve_trade_transport(int origin_city_id, int dest_city_id,
+                                   mp_cmd_route_transport_mode requested_mode,
+                                   mp_trade_route_transport *out_transport)
+{
+    int has_land = city_supports_land_trade(origin_city_id) && city_supports_land_trade(dest_city_id);
+    int has_sea = city_supports_sea_trade(origin_city_id) && city_supports_sea_trade(dest_city_id);
+
+    switch (requested_mode) {
+        case MP_CMD_ROUTE_TRANSPORT_LAND:
+            if (!has_land) {
+                return 0;
+            }
+            *out_transport = MP_TROUTE_LAND;
+            return 1;
+
+        case MP_CMD_ROUTE_TRANSPORT_SEA:
+            if (!has_sea) {
+                return 0;
+            }
+            *out_transport = MP_TROUTE_SEA;
+            return 1;
+
+        case MP_CMD_ROUTE_TRANSPORT_AUTO:
+        default:
+            if (has_land && !has_sea) {
+                *out_transport = MP_TROUTE_LAND;
+                return 1;
+            }
+            if (has_sea && !has_land) {
+                *out_transport = MP_TROUTE_SEA;
+                return 1;
+            }
+            if (has_land && has_sea) {
+                *out_transport = MP_TROUTE_LAND;
+                return 1;
+            }
+            return 0;
+    }
+}
 
 void mp_command_bus_init(void)
 {
@@ -80,6 +168,7 @@ static mp_command *dequeue_command(void)
 static int validate_create_trade_route(const mp_command *cmd)
 {
     const mp_cmd_create_trade_route *data = &cmd->data.create_route;
+    mp_trade_route_transport resolved_transport;
 
     /* Validate origin city exists and is owned by requesting player */
     empire_city *origin = empire_city_get(data->origin_city_id);
@@ -115,6 +204,16 @@ static int validate_create_trade_route(const mp_command *cmd)
     int player_routes = mp_ownership_count_player_routes(cmd->player_id);
     if (player_routes >= MAX_PLAYER_ROUTES) {
         return MP_CMD_REJECT_ROUTE_CAP_REACHED;
+    }
+
+    if (data->transport_mode > MP_CMD_ROUTE_TRANSPORT_SEA) {
+        return MP_CMD_REJECT_INVALID;
+    }
+
+    if (!resolve_trade_transport(data->origin_city_id, data->dest_city_id,
+                                 (mp_cmd_route_transport_mode)data->transport_mode,
+                                 &resolved_transport)) {
+        return MP_CMD_REJECT_NO_CONNECTIVITY;
     }
 
     return MP_CMD_REJECT_NONE;
@@ -363,22 +462,31 @@ static void broadcast_route_event(uint16_t event_type, int route_id,
                           (uint32_t)net_serializer_position(&s));
 }
 
-static void broadcast_route_created_event(int route_id, uint8_t player_id,
-                                            uint32_t network_route_id,
-                                            int dest_city_id, uint8_t dest_player_id,
-                                            mp_route_owner_mode mode)
+static void broadcast_route_created_event(uint32_t instance_id, int route_id,
+                                          uint32_t network_route_id,
+                                          int origin_city_id, uint8_t origin_player_id,
+                                          int dest_city_id, uint8_t dest_player_id,
+                                          mp_trade_route_transport transport,
+                                          mp_route_owner_mode mode,
+                                          mp_route_state state,
+                                          uint32_t state_version)
 {
-    uint8_t event_buf[80];
+    uint8_t event_buf[96];
     net_serializer s;
     net_serializer_init(&s, event_buf, sizeof(event_buf));
     net_write_u16(&s, NET_EVENT_ROUTE_CREATED);
     net_write_u32(&s, net_session_get_authoritative_tick());
+    net_write_u32(&s, instance_id);
     net_write_i32(&s, route_id);
-    net_write_u8(&s, player_id);
     net_write_u32(&s, network_route_id);
+    net_write_i32(&s, origin_city_id);
+    net_write_u8(&s, origin_player_id);
     net_write_i32(&s, dest_city_id);
     net_write_u8(&s, dest_player_id);
+    net_write_u8(&s, (uint8_t)transport);
     net_write_u8(&s, (uint8_t)mode);
+    net_write_u8(&s, (uint8_t)state);
+    net_write_u32(&s, state_version);
     net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
                           (uint32_t)net_serializer_position(&s));
 }
@@ -390,6 +498,7 @@ static void apply_command(mp_command *cmd)
     switch (cmd->command_type) {
         case MP_CMD_CREATE_TRADE_ROUTE: {
             const mp_cmd_create_trade_route *data = &cmd->data.create_route;
+            mp_trade_route_transport transport_type = MP_TROUTE_AUTO;
 
             /* Re-validate to guard against same-tick race */
             {
@@ -403,6 +512,13 @@ static void apply_command(mp_command *cmd)
                 if (player_routes >= MAX_PLAYER_ROUTES) {
                     cmd->status = MP_CMD_STATUS_REJECTED;
                     cmd->reject_reason = MP_CMD_REJECT_ROUTE_CAP_REACHED;
+                    return;
+                }
+                if (!resolve_trade_transport(data->origin_city_id, data->dest_city_id,
+                                             (mp_cmd_route_transport_mode)data->transport_mode,
+                                             &transport_type)) {
+                    cmd->status = MP_CMD_STATUS_REJECTED;
+                    cmd->reject_reason = MP_CMD_REJECT_NO_CONNECTIVITY;
                     return;
                 }
             }
@@ -424,7 +540,7 @@ static void apply_command(mp_command *cmd)
             /* Find or create a trade route in the Claudius system.
              * AI cities already have a route_id from the scenario data.
              * Player-to-player routes need a freshly allocated route entry. */
-            int route_id = empire_city_get_route_id(data->dest_city_id);
+            int route_id = empire_city_get_primary_legacy_route_id(data->dest_city_id);
             if (route_id <= 0) {
                 /* route_id 0 is the "discarded" route from trade_route_init() —
                  * never valid for real trade. Always allocate a fresh one. */
@@ -438,7 +554,8 @@ static void apply_command(mp_command *cmd)
 
             /* Register in ownership */
             if (mp_ownership_create_route(route_id, mode, cmd->player_id,
-                    dest_is_player ? dest_player : 0, network_id) < 0) {
+                    dest_is_player ? dest_player : 0,
+                    data->origin_city_id, data->dest_city_id, network_id) < 0) {
                 cmd->status = MP_CMD_STATUS_REJECTED;
                 return;
             }
@@ -450,23 +567,17 @@ static void apply_command(mp_command *cmd)
             if (!dest_is_player) {
                 empire_city_open_trade(data->dest_city_id, 1);
             } else {
-                /* P2P: mark both player cities as open for trade and assign route_id.
-                 * This allows generate_trader() to spawn caravans for P2P routes. */
+                /* P2P cities derive their legacy compatibility route from the
+                 * authoritative mp_trade_route table instead of latching one here. */
                 empire_city *dest_city = empire_city_get(data->dest_city_id);
                 if (dest_city && dest_city->in_use) {
                     dest_city->is_open = 1;
-                    if (dest_city->route_id <= 0) {
-                        dest_city->route_id = route_id;
-                    }
                 }
             }
             {
                 empire_city *origin_city = empire_city_get(data->origin_city_id);
                 if (origin_city && origin_city->in_use) {
                     origin_city->is_open = 1;
-                    if (origin_city->route_id <= 0) {
-                        origin_city->route_id = route_id;
-                    }
                 }
             }
 
@@ -485,11 +596,6 @@ static void apply_command(mp_command *cmd)
 
             /* Create the independent P2P route instance */
             {
-                empire_city *dest_ec = empire_city_get(data->dest_city_id);
-                mp_trade_route_transport transport_type = MP_TROUTE_LAND;
-                if (dest_ec && dest_ec->is_sea_trade) {
-                    transport_type = MP_TROUTE_SEA;
-                }
                 uint32_t inst_id = mp_trade_route_create(
                     cmd->player_id, data->origin_city_id,
                     dest_is_player ? dest_player : 0xFF, data->dest_city_id,
@@ -506,12 +612,22 @@ static void apply_command(mp_command *cmd)
             }
 
             log_info("Trade route created", 0, route_id);
-            broadcast_route_created_event(route_id, cmd->player_id, network_id,
-                data->dest_city_id,
-                dest_is_player ? dest_player : 0xFF, mode);
+            {
+                mp_trade_route_instance *mpr = mp_trade_route_find_by_claudius_route(route_id);
+                broadcast_route_created_event(
+                    mpr ? mpr->instance_id : 0,
+                    route_id, network_id,
+                    data->origin_city_id, cmd->player_id,
+                    data->dest_city_id, dest_is_player ? dest_player : 0xFF,
+                    transport_type, mode,
+                    mp_ownership_get_route_state(route_id),
+                    mp_ownership_get_route_version(route_id));
+            }
 
             /* Also broadcast full route state so clients get initial policy */
             mp_trade_sync_broadcast_route_state(route_id);
+            empire_city_refresh_trade_route_bindings(data->origin_city_id);
+            empire_city_refresh_trade_route_bindings(data->dest_city_id);
 
             /* Host: sync own city trade settings into empire_city struct
              * and force trade view update so remote cities see our exports/imports */
@@ -524,6 +640,8 @@ static void apply_command(mp_command *cmd)
 
         case MP_CMD_DELETE_TRADE_ROUTE: {
             int route_id = cmd->data.delete_route.route_id;
+            int origin_city_id = mp_ownership_get_route_origin_city(route_id);
+            int dest_city_id = mp_ownership_get_route_dest_city(route_id);
             /* Clean up in-transit traders before deleting the route */
             mp_trade_sync_cleanup_route_traders(route_id);
             mp_ownership_clear_route_traders(route_id);
@@ -536,6 +654,8 @@ static void apply_command(mp_command *cmd)
             }
             mp_ownership_delete_route(route_id);
             trade_route_clear_player_binding(route_id);
+            empire_city_refresh_trade_route_bindings(origin_city_id);
+            empire_city_refresh_trade_route_bindings(dest_city_id);
             log_info("Trade route deleted", 0, route_id);
             broadcast_route_event(NET_EVENT_ROUTE_DELETED, route_id,
                                   cmd->player_id, cmd->data.delete_route.network_route_id);
@@ -545,6 +665,8 @@ static void apply_command(mp_command *cmd)
         case MP_CMD_ENABLE_TRADE_ROUTE: {
             int route_id = cmd->data.enable_route.route_id;
             mp_ownership_set_route_state(route_id, MP_ROUTE_STATE_ACTIVE);
+            empire_city_refresh_trade_route_bindings(mp_ownership_get_route_origin_city(route_id));
+            empire_city_refresh_trade_route_bindings(mp_ownership_get_route_dest_city(route_id));
             log_info("Trade route enabled", 0, route_id);
             broadcast_route_event(NET_EVENT_ROUTE_ENABLED, route_id,
                                   cmd->player_id, cmd->data.enable_route.network_route_id);
@@ -554,6 +676,8 @@ static void apply_command(mp_command *cmd)
         case MP_CMD_DISABLE_TRADE_ROUTE: {
             int route_id = cmd->data.disable_route.route_id;
             mp_ownership_set_route_state(route_id, MP_ROUTE_STATE_DISABLED);
+            empire_city_refresh_trade_route_bindings(mp_ownership_get_route_origin_city(route_id));
+            empire_city_refresh_trade_route_bindings(mp_ownership_get_route_dest_city(route_id));
             log_info("Trade route disabled", 0, route_id);
             broadcast_route_event(NET_EVENT_ROUTE_DISABLED, route_id,
                                   cmd->player_id, cmd->data.disable_route.network_route_id);
@@ -562,10 +686,21 @@ static void apply_command(mp_command *cmd)
 
         case MP_CMD_SET_ROUTE_POLICY: {
             const mp_cmd_set_route_policy *data = &cmd->data.route_policy;
+            mp_trade_route_instance *mpr = mp_trade_route_find_by_claudius_route(data->route_id);
             if (data->is_export) {
                 trade_route_set_export_enabled(data->route_id, data->resource, data->enabled);
+                if (mpr) {
+                    mp_trade_route_set_resource_export(mpr->instance_id, data->resource,
+                                                       data->enabled,
+                                                       mpr->resources[data->resource].export_limit);
+                }
             } else {
                 trade_route_set_import_enabled(data->route_id, data->resource, data->enabled);
+                if (mpr) {
+                    mp_trade_route_set_resource_import(mpr->instance_id, data->resource,
+                                                       data->enabled,
+                                                       mpr->resources[data->resource].import_limit);
+                }
             }
             mp_ownership_increment_route_version(data->route_id);
             mp_trade_sync_broadcast_route_policy(data->route_id, data->resource,
@@ -575,8 +710,18 @@ static void apply_command(mp_command *cmd)
 
         case MP_CMD_SET_ROUTE_LIMIT: {
             const mp_cmd_set_route_limit *data = &cmd->data.route_limit;
+            mp_trade_route_instance *mpr = mp_trade_route_find_by_claudius_route(data->route_id);
             trade_route_set_limit(data->route_id, data->resource,
                                   data->amount, data->is_buying);
+            if (mpr) {
+                if (data->is_buying) {
+                    mp_trade_route_set_resource_import_limit(mpr->instance_id, data->resource,
+                                                             data->amount);
+                } else {
+                    mp_trade_route_set_resource_export_limit(mpr->instance_id, data->resource,
+                                                             data->amount);
+                }
+            }
             mp_ownership_increment_route_version(data->route_id);
             mp_trade_sync_broadcast_route_limit(data->route_id, data->resource,
                                                  data->is_buying, data->amount);
@@ -867,6 +1012,31 @@ mp_command_status mp_command_bus_get_last_status(void)
 uint8_t mp_command_bus_get_last_reject_reason(void)
 {
     return bus.last_reject_reason;
+}
+
+const char *mp_command_bus_reject_reason_text(uint8_t reason)
+{
+    switch (reason) {
+        case MP_CMD_REJECT_NOT_OWNER: return "Permissao insuficiente";
+        case MP_CMD_REJECT_ROUTE_NOT_FOUND: return "Rota nao encontrada";
+        case MP_CMD_REJECT_ALREADY_OPEN: return "Rota ja esta aberta";
+        case MP_CMD_REJECT_ALREADY_CLOSED: return "Rota ja esta fechada";
+        case MP_CMD_REJECT_LIMIT_OUT_OF_RANGE: return "Limite invalido";
+        case MP_CMD_REJECT_CITY_NOT_FOUND: return "Cidade nao encontrada";
+        case MP_CMD_REJECT_CITY_NOT_OWNED: return "Cidade nao pertence ao jogador";
+        case MP_CMD_REJECT_CITY_OFFLINE: return "Cidade offline";
+        case MP_CMD_REJECT_DUPLICATE_ROUTE: return "A rota ja existe";
+        case MP_CMD_REJECT_ROUTE_CAP_REACHED: return "Limite de rotas atingido";
+        case MP_CMD_REJECT_NO_CONNECTIVITY: return "Sem conectividade";
+        case MP_CMD_REJECT_ROUTE_DISABLED: return "Rota desabilitada";
+        case MP_CMD_REJECT_ROUTE_ALREADY_ENABLED: return "Rota ja habilitada";
+        case MP_CMD_REJECT_ROUTE_ALREADY_DISABLED: return "Rota ja desabilitada";
+        case MP_CMD_REJECT_PLAYER_DISCONNECTED: return "Jogador desconectado";
+        case MP_CMD_REJECT_RESOURCE_INVALID: return "Recurso invalido";
+        case MP_CMD_REJECT_INVALID:
+        default:
+            return "Comando rejeitado";
+    }
 }
 
 uint32_t mp_command_bus_get_next_sequence_id(void)

@@ -20,7 +20,8 @@
 #include <arpa/inet.h>
 #endif
 
-#define ANNOUNCE_PACKET_SIZE 64
+#define ANNOUNCE_PACKET_SIZE 96
+#define ANNOUNCE_PACKET_LEGACY_SIZE 44
 
 /*
  * HOST_EXPIRY_MS must be > 2 * NET_DISCOVERY_BROADCAST_MS to tolerate
@@ -36,11 +37,7 @@ typedef struct {
     uint32_t last_broadcast_ms;
 
     /* Announce data */
-    char host_name[32];
-    uint16_t game_port;
-    uint8_t player_count;
-    uint8_t max_players;
-    uint32_t session_id;
+    net_discovery_announcement announcement;
 
     /* Discovered hosts */
     net_discovered_host hosts[NET_MAX_DISCOVERED_HOSTS];
@@ -48,6 +45,18 @@ typedef struct {
 } discovery_data;
 
 static discovery_data data;
+
+static const uint8_t ZERO_WORLD_UUID[NET_DISCOVERY_WORLD_UUID_SIZE] = {0};
+
+static void copy_announcement(net_discovery_announcement *dst,
+                              const net_discovery_announcement *src)
+{
+    if (!dst || !src) {
+        return;
+    }
+    memcpy(dst, src, sizeof(*dst));
+    dst->host_name[sizeof(dst->host_name) - 1] = '\0';
+}
 
 void net_discovery_init(void)
 {
@@ -64,12 +73,13 @@ void net_discovery_shutdown(void)
     MP_LOG_INFO("DISCOVERY", "Discovery system shutdown");
 }
 
-int net_discovery_start_announcing(const char *host_name, uint16_t game_port,
-                                   uint8_t player_count, uint8_t max_players,
-                                   uint32_t session_id)
+int net_discovery_start_announcing(const net_discovery_announcement *announcement)
 {
     if (data.announcing) {
         return 1;
+    }
+    if (!announcement) {
+        return 0;
     }
 
     if (data.udp_fd < 0) {
@@ -85,18 +95,19 @@ int net_discovery_start_announcing(const char *host_name, uint16_t game_port,
         }
     }
 
-    strncpy(data.host_name, host_name, sizeof(data.host_name) - 1);
-    data.host_name[sizeof(data.host_name) - 1] = '\0';
-    data.game_port = game_port;
-    data.player_count = player_count;
-    data.max_players = max_players;
-    data.session_id = session_id;
+    copy_announcement(&data.announcement, announcement);
     data.announcing = 1;
     data.last_broadcast_ms = 0;
 
-    log_info("LAN discovery announcing started", host_name, 0);
-    MP_LOG_INFO("DISCOVERY", "Start announcing: name='%s' port=%d session=0x%08x players=%d/%d",
-                host_name, (int)game_port, session_id, player_count, max_players);
+    log_info("LAN discovery announcing started", data.announcement.host_name, 0);
+    MP_LOG_INFO("DISCOVERY", "Start announcing: name='%s' port=%d session=0x%08x players=%d/%d phase=%s policy=%s",
+                data.announcement.host_name, (int)data.announcement.game_port,
+                data.announcement.session_id, data.announcement.player_count,
+                data.announcement.max_players,
+                net_discovery_session_phase_name(
+                    (net_discovery_session_phase)data.announcement.session_phase),
+                net_discovery_join_policy_name(
+                    (net_discovery_join_policy)data.announcement.join_policy));
     return 1;
 }
 
@@ -113,9 +124,12 @@ void net_discovery_stop_announcing(void)
     }
 }
 
-void net_discovery_update_announcing(uint8_t player_count)
+void net_discovery_update_announcing(const net_discovery_announcement *announcement)
 {
-    data.player_count = player_count;
+    if (!announcement) {
+        return;
+    }
+    copy_announcement(&data.announcement, announcement);
 }
 
 int net_discovery_start_listening(void)
@@ -167,11 +181,18 @@ static void send_announcement(void)
     net_serializer_init(&s, buf, sizeof(buf));
 
     net_write_u32(&s, NET_DISCOVERY_MAGIC);
-    net_write_u32(&s, data.session_id);
-    net_write_u16(&s, data.game_port);
-    net_write_u8(&s, data.player_count);
-    net_write_u8(&s, data.max_players);
-    net_write_raw(&s, data.host_name, 32);
+    net_write_u32(&s, data.announcement.session_id);
+    net_write_u16(&s, data.announcement.game_port);
+    net_write_u8(&s, data.announcement.player_count);
+    net_write_u8(&s, data.announcement.max_players);
+    net_write_raw(&s, data.announcement.host_name, 32);
+    net_write_u16(&s, data.announcement.protocol_version);
+    net_write_u8(&s, data.announcement.session_phase);
+    net_write_u8(&s, data.announcement.join_policy);
+    net_write_u8(&s, data.announcement.reserved_slots_free);
+    net_write_raw(&s, data.announcement.world_instance_uuid,
+                  NET_DISCOVERY_WORLD_UUID_SIZE);
+    net_write_u32(&s, data.announcement.resume_generation);
 
     if (!net_serializer_has_overflow(&s)) {
         int sent = net_udp_send_broadcast(data.udp_fd, NET_DISCOVERY_PORT,
@@ -183,8 +204,9 @@ static void send_announcement(void)
 
 static void process_announcement(const uint8_t *buf, size_t size, const net_udp_addr *from)
 {
-    if (size < 44) {
-        MP_LOG_WARN("DISCOVERY", "Received undersized announcement: %d bytes (need >= 44)", (int)size);
+    if (size < ANNOUNCE_PACKET_LEGACY_SIZE) {
+        MP_LOG_WARN("DISCOVERY", "Received undersized announcement: %d bytes (need >= %d)",
+                    (int)size, ANNOUNCE_PACKET_LEGACY_SIZE);
         return;
     }
 
@@ -203,8 +225,35 @@ static void process_announcement(const uint8_t *buf, size_t size, const net_udp_
     uint8_t player_count = net_read_u8(&s);
     uint8_t max_players = net_read_u8(&s);
     char host_name[32];
+    uint16_t protocol_version = 0;
+    uint8_t session_phase = NET_DISCOVERY_PHASE_LOBBY;
+    uint8_t join_policy = NET_DISCOVERY_JOIN_OPEN_LOBBY;
+    uint8_t reserved_slots_free = 0;
+    uint8_t world_instance_uuid[NET_DISCOVERY_WORLD_UUID_SIZE];
+    uint32_t resume_generation = 0;
     net_read_raw(&s, host_name, 32);
     host_name[31] = '\0';
+    memcpy(world_instance_uuid, ZERO_WORLD_UUID, sizeof(world_instance_uuid));
+
+    if (!net_serializer_has_overflow(&s) && net_serializer_remaining(&s) >= 2) {
+        protocol_version = net_read_u16(&s);
+    }
+    if (!net_serializer_has_overflow(&s) && net_serializer_remaining(&s) >= 1) {
+        session_phase = net_read_u8(&s);
+    }
+    if (!net_serializer_has_overflow(&s) && net_serializer_remaining(&s) >= 1) {
+        join_policy = net_read_u8(&s);
+    }
+    if (!net_serializer_has_overflow(&s) && net_serializer_remaining(&s) >= 1) {
+        reserved_slots_free = net_read_u8(&s);
+    }
+    if (!net_serializer_has_overflow(&s) &&
+        net_serializer_remaining(&s) >= NET_DISCOVERY_WORLD_UUID_SIZE) {
+        net_read_raw(&s, world_instance_uuid, NET_DISCOVERY_WORLD_UUID_SIZE);
+    }
+    if (!net_serializer_has_overflow(&s) && net_serializer_remaining(&s) >= 4) {
+        resume_generation = net_read_u32(&s);
+    }
 
     /* Extract sender IP directly from the UDP address using inet_ntop.
      * This avoids the old colon-stripping hack which would break IPv6. */
@@ -216,7 +265,7 @@ static void process_announcement(const uint8_t *buf, size_t size, const net_udp_
     uint32_t now = net_tcp_get_timestamp_ms();
 
     /* Ignore our own announcements */
-    if (data.announcing && data.session_id == sess_id) {
+    if (data.announcing && data.announcement.session_id == sess_id) {
         return;
     }
 
@@ -224,9 +273,21 @@ static void process_announcement(const uint8_t *buf, size_t size, const net_udp_
     for (int i = 0; i < NET_MAX_DISCOVERED_HOSTS; i++) {
         if (data.hosts[i].active && data.hosts[i].session_id == sess_id) {
             data.hosts[i].player_count = player_count;
+            data.hosts[i].max_players = max_players;
+            data.hosts[i].protocol_version = protocol_version;
+            data.hosts[i].session_phase = session_phase;
+            data.hosts[i].join_policy = join_policy;
+            data.hosts[i].reserved_slots_free = reserved_slots_free;
+            memcpy(data.hosts[i].world_instance_uuid, world_instance_uuid,
+                   NET_DISCOVERY_WORLD_UUID_SIZE);
+            data.hosts[i].resume_generation = resume_generation;
             data.hosts[i].last_seen_ms = now;
-            MP_LOG_TRACE("DISCOVERY", "Updated known host '%s' at %s (players=%d/%d)",
-                         host_name, sender_ip, player_count, max_players);
+            MP_LOG_TRACE("DISCOVERY", "Updated known host '%s' at %s (players=%d/%d phase=%s policy=%s)",
+                         host_name, sender_ip, player_count, max_players,
+                         net_discovery_session_phase_name(
+                             (net_discovery_session_phase)session_phase),
+                         net_discovery_join_policy_name(
+                             (net_discovery_join_policy)join_policy));
             return;
         }
     }
@@ -262,13 +323,23 @@ static void process_announcement(const uint8_t *buf, size_t size, const net_udp_
         h->player_count = player_count;
         h->max_players = max_players;
         h->session_id = sess_id;
+        h->protocol_version = protocol_version;
+        h->session_phase = session_phase;
+        h->join_policy = join_policy;
+        h->reserved_slots_free = reserved_slots_free;
+        memcpy(h->world_instance_uuid, world_instance_uuid, NET_DISCOVERY_WORLD_UUID_SIZE);
+        h->resume_generation = resume_generation;
         h->last_seen_ms = now;
         if (slot >= data.host_count) {
             data.host_count = slot + 1;
         }
 
-        MP_LOG_INFO("DISCOVERY", "New host discovered: '%s' at %s:%d (session=0x%08x, players=%d/%d)",
-                    host_name, sender_ip, (int)game_port, sess_id, player_count, max_players);
+        MP_LOG_INFO("DISCOVERY", "New host discovered: '%s' at %s:%d (session=0x%08x, players=%d/%d phase=%s policy=%s)",
+                    host_name, sender_ip, (int)game_port, sess_id, player_count, max_players,
+                    net_discovery_session_phase_name(
+                        (net_discovery_session_phase)session_phase),
+                    net_discovery_join_policy_name(
+                        (net_discovery_join_policy)join_policy));
     }
 }
 
@@ -345,6 +416,36 @@ void net_discovery_clear_hosts(void)
 {
     memset(data.hosts, 0, sizeof(data.hosts));
     data.host_count = 0;
+}
+
+const char *net_discovery_session_phase_name(net_discovery_session_phase phase)
+{
+    switch (phase) {
+        case NET_DISCOVERY_PHASE_LOBBY:
+            return "LOBBY";
+        case NET_DISCOVERY_PHASE_IN_GAME:
+            return "IN_GAME";
+        case NET_DISCOVERY_PHASE_RESUME_LOBBY:
+            return "RESUME_LOBBY";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+const char *net_discovery_join_policy_name(net_discovery_join_policy policy)
+{
+    switch (policy) {
+        case NET_DISCOVERY_JOIN_OPEN_LOBBY:
+            return "OPEN_LOBBY";
+        case NET_DISCOVERY_JOIN_RECONNECT_ONLY:
+            return "RECONNECT_ONLY";
+        case NET_DISCOVERY_JOIN_LATE_JOIN_ALLOWED:
+            return "LATE_JOIN_ALLOWED";
+        case NET_DISCOVERY_JOIN_CLOSED:
+            return "CLOSED";
+        default:
+            return "UNKNOWN";
+    }
 }
 
 #endif /* ENABLE_MULTIPLAYER */

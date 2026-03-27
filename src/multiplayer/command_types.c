@@ -40,7 +40,7 @@ void mp_command_serialize(const mp_command *cmd, uint8_t *buffer, uint32_t *size
         case MP_CMD_CREATE_TRADE_ROUTE:
             net_write_i32(&s, cmd->data.create_route.origin_city_id);
             net_write_i32(&s, cmd->data.create_route.dest_city_id);
-            net_write_u8(&s, cmd->data.create_route.prefer_sea);
+            net_write_u8(&s, cmd->data.create_route.transport_mode);
             break;
 
         case MP_CMD_DELETE_TRADE_ROUTE:
@@ -139,7 +139,7 @@ int mp_command_deserialize(mp_command *cmd, const uint8_t *buffer, uint32_t size
         case MP_CMD_CREATE_TRADE_ROUTE:
             cmd->data.create_route.origin_city_id = net_read_i32(&s);
             cmd->data.create_route.dest_city_id = net_read_i32(&s);
-            cmd->data.create_route.prefer_sea = net_read_u8(&s);
+            cmd->data.create_route.transport_mode = net_read_u8(&s);
             break;
 
         case MP_CMD_DELETE_TRADE_ROUTE:

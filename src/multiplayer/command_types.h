@@ -85,6 +85,12 @@ typedef enum {
     MP_CMD_REJECT_PLAYER_DISCONNECTED
 } mp_command_reject_reason;
 
+typedef enum {
+    MP_CMD_ROUTE_TRANSPORT_AUTO = 0,
+    MP_CMD_ROUTE_TRANSPORT_LAND = 1,
+    MP_CMD_ROUTE_TRANSPORT_SEA = 2
+} mp_cmd_route_transport_mode;
+
 /* ---- Command payloads ---- */
 
 /**
@@ -95,7 +101,7 @@ typedef enum {
 typedef struct {
     int origin_city_id;   /* Must be owned by the requesting player */
     int dest_city_id;     /* Target city (may be AI or another player) */
-    uint8_t prefer_sea;   /* 1 = prefer sea route, 0 = prefer land */
+    uint8_t transport_mode;   /* mp_cmd_route_transport_mode */
 } mp_cmd_create_trade_route;
 
 /**

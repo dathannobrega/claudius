@@ -6,6 +6,7 @@
 #include "city/resource.h"
 #include "empire/city.h"
 #include "empire/empire.h"
+#include "empire/trade_route.h"
 #include "figure/figure.h"
 #include "figure/trader.h"
 #include "figure/visited_buildings.h"
@@ -17,6 +18,11 @@
 #include "map/routing_data.h"
 #include "map/terrain.h"
 #include "scenario/map.h"
+
+#ifdef ENABLE_MULTIPLAYER
+#include "multiplayer/ownership.h"
+#include "network/session.h"
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -79,7 +85,19 @@ int building_dock_accepts_ship(int ship_id, int dock_id)
     building *dock = building_get(dock_id);
     figure *f = figure_get(ship_id);
     empire_city *city = empire_city_get(f->empire_city_id);
-    if (!building_dock_can_trade_with_route(city->route_id, dock_id)) {
+    int route_id = empire_city_get_primary_legacy_route_id(f->empire_city_id);
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        int trader_route_id = mp_ownership_get_trader_route(ship_id);
+        if (trader_route_id >= 0) {
+            route_id = trader_route_id;
+        }
+    }
+#endif
+    if (!city) {
+        return 0;
+    }
+    if (!building_dock_can_trade_with_route(route_id, dock_id)) {
         return 0;
     }
     for (int resource = RESOURCE_MIN; resource < RESOURCE_MAX; resource++) {

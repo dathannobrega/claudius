@@ -22,13 +22,28 @@
 #include "game/resource.h"
 #include "map/road_access.h"
 #ifdef ENABLE_MULTIPLAYER
+#include "multiplayer/ownership.h"
 #include "multiplayer/trade_sync.h"
 #include "network/session.h"
 #endif
 
 #define INFINITE 10000
 
-static int try_import_resource(int building_id, int resource, int city_id, int quantity)
+static int resolve_docker_route_id(int city_id, int ship_id)
+{
+    int route_id = empire_city_get_primary_legacy_route_id(city_id);
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active() && ship_id > 0) {
+        int trader_route_id = mp_ownership_get_trader_route(ship_id);
+        if (trader_route_id > 0) {
+            return trader_route_id;
+        }
+    }
+#endif
+    return route_id;
+}
+
+static int try_import_resource(int building_id, int resource, int city_id, int quantity, int ship_id)
 {
 #ifdef ENABLE_MULTIPLAYER
     /* Only the host performs warehouse mutations; clients wait for events */
@@ -50,25 +65,25 @@ static int try_import_resource(int building_id, int resource, int city_id, int q
         return 0;
     }
 
-    int route_id = empire_city_get_route_id(city_id);
+    int route_id = resolve_docker_route_id(city_id, ship_id);
     int result = 0;
     if (b->type == BUILDING_GRANARY) {
         result = building_granary_add_import(b, resource, 1, 0);
-        if (result) {
+        if (result && route_id > 0) {
             trade_route_increase_traded(route_id, resource, 0);
 #ifdef ENABLE_MULTIPLAYER
             if (net_session_is_active()) {
-                mp_trade_sync_emit_trader_trade_executed(0, resource, result, 0, building_id);
+                mp_trade_sync_emit_trader_trade_executed(ship_id, resource, result, 0, building_id);
             }
 #endif
         }
     } else if (b->type == BUILDING_WAREHOUSE) {
         result = building_warehouse_add_import(b, resource, quantity, 0);
-        if (result) {
+        if (result && route_id > 0) {
             trade_route_increase_traded(route_id, resource, 0);
 #ifdef ENABLE_MULTIPLAYER
             if (net_session_is_active()) {
-                mp_trade_sync_emit_trader_trade_executed(0, resource, result, 0, building_id);
+                mp_trade_sync_emit_trader_trade_executed(ship_id, resource, result, 0, building_id);
             }
 #endif
         }
@@ -76,7 +91,7 @@ static int try_import_resource(int building_id, int resource, int city_id, int q
     return result;
 }
 
-static int try_export_resource(int building_id, int resource, int city_id)
+static int try_export_resource(int building_id, int resource, int city_id, int ship_id)
 {
 #ifdef ENABLE_MULTIPLAYER
     /* Only the host performs warehouse mutations; clients wait for events */
@@ -92,24 +107,25 @@ static int try_export_resource(int building_id, int resource, int city_id)
     if (!building_storage_get_permission(BUILDING_STORAGE_PERMISSION_DOCK, b)) {
         return 0;
     }
+    int route_id = resolve_docker_route_id(city_id, ship_id);
     int result = 0;
     if (b->type == BUILDING_GRANARY) {
         result = building_granary_remove_export(b, resource, 1, 0);
-        if (result) {
-            trade_route_increase_traded(empire_city_get_route_id(city_id), resource, 1);
+        if (result && route_id > 0) {
+            trade_route_increase_traded(route_id, resource, 1);
 #ifdef ENABLE_MULTIPLAYER
             if (net_session_is_active()) {
-                mp_trade_sync_emit_trader_trade_executed(0, resource, result, 1, building_id);
+                mp_trade_sync_emit_trader_trade_executed(ship_id, resource, result, 1, building_id);
             }
 #endif
         }
     } else if (b->type == BUILDING_WAREHOUSE) {
         result = building_warehouse_remove_export(b, resource, 1, 0);
-        if (result) {
-            trade_route_increase_traded(empire_city_get_route_id(city_id), resource, 1);
+        if (result && route_id > 0) {
+            trade_route_increase_traded(route_id, resource, 1);
 #ifdef ENABLE_MULTIPLAYER
             if (net_session_is_active()) {
-                mp_trade_sync_emit_trader_trade_executed(0, resource, result, 1, building_id);
+                mp_trade_sync_emit_trader_trade_executed(ship_id, resource, result, 1, building_id);
             }
 #endif
         }
@@ -527,7 +543,7 @@ void figure_docker_action(figure *f)
                     trade_city_id = 0;
                 }
                 if (try_import_resource(f->destination_building_id, f->resource_id,
-                    trade_city_id, f->loads_sold_or_carrying)) {
+                    trade_city_id, f->loads_sold_or_carrying, b->data.dock.trade_ship_id)) {
                     int trader_id = figure_get(b->data.dock.trade_ship_id)->trader_id;
                     trader_record_sold_resource(trader_id, f->resource_id);
                     city_health_update_sickness_level_in_building(b->id);
@@ -561,7 +577,8 @@ void figure_docker_action(figure *f)
                 f->destination_x = f->source_x;
                 f->destination_y = f->source_y;
                 f->wait_ticks = 0;
-                if (try_export_resource(f->destination_building_id, f->resource_id, trade_city_id)) {
+                if (try_export_resource(f->destination_building_id, f->resource_id,
+                    trade_city_id, b->data.dock.trade_ship_id)) {
                     int trader_id = figure_get(b->data.dock.trade_ship_id)->trader_id;
                     trader_record_bought_resource(trader_id, f->resource_id);
                     city_health_update_sickness_level_in_building(b->id);

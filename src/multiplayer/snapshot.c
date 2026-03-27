@@ -7,6 +7,7 @@
 #include "trade_sync.h"
 #include "mp_trade_route.h"
 #include "empire_sync.h"
+#include "empire/city.h"
 #include "time_sync.h"
 #include "worldgen.h"
 #include "network/serialize.h"
@@ -177,6 +178,8 @@ int mp_snapshot_apply_full(const uint8_t *buffer, uint32_t size)
             buffer + header.domain_offsets[MP_SNAPSHOT_TIME],
             header.domain_sizes[MP_SNAPSHOT_TIME]);
     }
+
+    empire_city_refresh_all_trade_route_bindings();
 
     last_snapshot_tick = header.tick;
     log_info("Full snapshot applied at tick", 0, (int)header.tick);

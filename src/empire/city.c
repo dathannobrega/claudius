@@ -27,6 +27,9 @@
 #include "scenario/property.h"
 
 #ifdef ENABLE_MULTIPLAYER
+#include "multiplayer/mp_trade_route.h"
+#include "multiplayer/ownership.h"
+#include "multiplayer/trade_sync.h"
 #include "network/session.h"
 #endif
 
@@ -37,6 +40,7 @@
 #define SEA_TRADER_DELAY_DAYS 30
 #define LEGACY_MAX_CITIES 41
 #define CITIES_ARRAY_SIZE_STEP 50
+#define MAX_CITY_ROUTE_VIEWS 64
 
 #define NOT_SELLING 0
 
@@ -367,8 +371,91 @@ void empire_city_set_trade_route_cost(int route_id, int new_cost)
     }
 }
 
+#ifdef ENABLE_MULTIPLAYER
+typedef struct {
+    int city_id;
+    int has_any_route;
+    int preferred_route_id;
+    int fallback_route_id;
+} mp_city_route_binding_refresh;
+
+static int collect_primary_mp_route_for_city(mp_trade_route_instance *route, void *userdata)
+{
+    mp_city_route_binding_refresh *refresh = userdata;
+
+    if (!refresh || !route || !route->in_use || route->claudius_route_id <= 0) {
+        return 0;
+    }
+    if (route->origin_city_id != refresh->city_id && route->dest_city_id != refresh->city_id) {
+        return 0;
+    }
+
+    refresh->has_any_route = 1;
+    if (!refresh->fallback_route_id || route->claudius_route_id < refresh->fallback_route_id) {
+        refresh->fallback_route_id = route->claudius_route_id;
+    }
+
+    if (route->status == MP_TROUTE_ACTIVE &&
+        (!refresh->preferred_route_id || route->claudius_route_id < refresh->preferred_route_id)) {
+        refresh->preferred_route_id = route->claudius_route_id;
+    }
+
+    return 0;
+}
+#endif
+
+void empire_city_refresh_trade_route_bindings(int city_id)
+{
+#ifdef ENABLE_MULTIPLAYER
+    empire_city *city = empire_city_get(city_id);
+    if (!city || !city->in_use || !net_session_is_active() || !empire_city_is_player_owned(city_id)) {
+        return;
+    }
+
+    mp_city_route_binding_refresh refresh;
+    memset(&refresh, 0, sizeof(refresh));
+    refresh.city_id = city_id;
+
+    mp_trade_route_foreach(collect_primary_mp_route_for_city, &refresh);
+
+    city->route_id = refresh.preferred_route_id > 0
+        ? refresh.preferred_route_id
+        : refresh.fallback_route_id;
+    city->is_open = refresh.has_any_route ? 1 : 0;
+#else
+    (void)city_id;
+#endif
+}
+
+void empire_city_refresh_all_trade_route_bindings(void)
+{
+#ifdef ENABLE_MULTIPLAYER
+    if (!net_session_is_active()) {
+        return;
+    }
+
+    empire_city *city;
+    array_foreach(cities, city) {
+        if (!city->in_use || !empire_city_is_player_owned(array_index)) {
+            continue;
+        }
+        empire_city_refresh_trade_route_bindings(array_index);
+    }
+#endif
+}
+
 void empire_city_reset_yearly_trade_amounts(void)
 {
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        int route_count = trade_route_count();
+        for (int route_id = 1; route_id < route_count; route_id++) {
+            trade_route_reset_traded(route_id);
+        }
+        return;
+    }
+#endif
+
     empire_city *city;
     array_foreach(cities, city) {
         if (city->in_use && city->is_open) {
@@ -384,9 +471,11 @@ void empire_city_change_buying_of_resource(empire_city *city, resource_type reso
     empire_object_get_full(city->empire_object_id)->city_buys_resource[resource] = amount;
     int set_limit = (city->type != EMPIRE_CITY_OURS);
 #ifdef ENABLE_MULTIPLAYER
-    /* In MP, player cities (OURS) also need route limits for P2P trade */
-    if (!set_limit && net_session_is_active() && city->route_id > 0) {
-        set_limit = 1;
+    /* Player-city trade in multiplayer is controlled per route.
+     * Keep the city-level buys[] array as an aggregate view only. */
+    if (net_session_is_active() &&
+        (city->owner_type == CITY_OWNER_LOCAL || city->owner_type == CITY_OWNER_REMOTE)) {
+        set_limit = 0;
     }
 #endif
     if (set_limit) {
@@ -401,9 +490,11 @@ void empire_city_change_selling_of_resource(empire_city *city, resource_type res
     empire_object_get_full(city->empire_object_id)->city_sells_resource[resource] = amount;
     int set_limit = (city->type != EMPIRE_CITY_OURS);
 #ifdef ENABLE_MULTIPLAYER
-    /* In MP, player cities (OURS) also need route limits for P2P trade */
-    if (!set_limit && net_session_is_active() && city->route_id > 0) {
-        set_limit = 1;
+    /* Player-city trade in multiplayer is controlled per route.
+     * Keep the city-level sells[] array as an aggregate view only. */
+    if (net_session_is_active() &&
+        (city->owner_type == CITY_OWNER_LOCAL || city->owner_type == CITY_OWNER_REMOTE)) {
+        set_limit = 0;
     }
 #endif
     if (set_limit) {
@@ -455,26 +546,47 @@ void empire_city_expand_empire(void)
 
 static int generate_trader(int city_id, empire_city *city)
 {
+    trade_route_view route_views[MAX_CITY_ROUTE_VIEWS];
+    trade_route_view selected_route;
+    int route_count = 0;
+    int total_trade_potential = 0;
+    int best_trade_potential = 0;
+    int selected_route_index = -1;
+
     // Check timeout before city can send another trader
     if (city->trader_entry_delay > 0) {
         city->trader_entry_delay--;
         return 0;
     }
-    city->trader_entry_delay = city->is_sea_trade ? SEA_TRADER_DELAY_DAYS : LAND_TRADER_DELAY_DAYS;
 
-    // Check that we have space to trade
-    int trade_potential = 0;
-    for (int r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
-        if (city->buys_resource[r] || city->sells_resource[r]) {
-            trade_potential += trade_route_limit(city->route_id, r, city->buys_resource[r]);
+    route_count = trade_route_list_for_city(city_id, route_views, MAX_CITY_ROUTE_VIEWS);
+    for (int i = 0; i < route_count; i++) {
+        int route_potential = trade_route_view_estimate_potential(&route_views[i]);
+        if (route_potential <= 0) {
+            continue;
+        }
+
+        total_trade_potential += route_potential;
+        if (route_views[i].transport == 0) {
+            city_trade_add_land_trade_route();
+        } else {
+            city_trade_add_sea_trade_route();
+        }
+
+        if (route_potential > best_trade_potential) {
+            best_trade_potential = route_potential;
+            selected_route_index = i;
         }
     }
-    if (trade_potential <= 0) {
+
+    if (selected_route_index < 0 || total_trade_potential <= 0) {
         return 0;
     }
+    selected_route = route_views[selected_route_index];
+    city->trader_entry_delay = selected_route.transport == 0 ? LAND_TRADER_DELAY_DAYS : SEA_TRADER_DELAY_DAYS;
 
     // Find a slot to hold a trader
-    int max_traders = calc_bound(trade_potential / RESOURCES_TO_TRADER_RATIO + 1, 1, EMPIRE_CITY_MAX_TRADERS);
+    int max_traders = calc_bound(total_trade_potential / RESOURCES_TO_TRADER_RATIO + 1, 1, EMPIRE_CITY_MAX_TRADERS);
     int index = -1;
     for (int i = 0; i < max_traders; i++) {
         if (!city->trader_figure_ids[i]) {
@@ -486,20 +598,48 @@ static int generate_trader(int city_id, empire_city *city)
         return 0;
     }
 
-    if (city->is_sea_trade) {
+    if (selected_route.transport != 0) {
         // generate ship
-        if (city_buildings_has_working_dock() && scenario_map_has_river_entry()
-            && !city_trade_has_sea_trade_problems()) {
-            map_point river_entry = scenario_map_river_entry();
-            city->trader_figure_ids[index] = figure_create_trade_ship(river_entry.x, river_entry.y, city_id);
-            return 1;
+        if (!city_buildings_has_working_dock()) {
+            city_message_post_with_message_delay(MESSAGE_CAT_NO_WORKING_DOCK, 1, MESSAGE_NO_WORKING_DOCK, 384);
+            return 0;
         }
+        if (!scenario_map_has_river_entry() || city_trade_has_sea_trade_problems()) {
+            return 0;
+        }
+        map_point river_entry = scenario_map_river_entry();
+        city->trader_figure_ids[index] = figure_create_trade_ship(river_entry.x, river_entry.y, city_id);
+#ifdef ENABLE_MULTIPLAYER
+        if (net_session_is_active() && city->trader_figure_ids[index] > 0) {
+            int owner_pid = empire_city_is_player_owned(city_id)
+                ? empire_city_get_owner_player_id(city_id)
+                : 0;
+            mp_ownership_set_trader(city->trader_figure_ids[index], (uint8_t)(owner_pid >= 0 ? owner_pid : 0),
+                city_id, selected_route.counterpart_city_id, selected_route.route_id);
+            if (net_session_is_host()) {
+                mp_trade_sync_emit_trader_spawned(city->trader_figure_ids[index], city_id, selected_route.route_id);
+            }
+        }
+#endif
+        return 1;
     } else {
         // generate caravan and donkeys
         if (!city_trade_has_land_trade_problems()) {
             // caravan head
             const map_tile *entry = city_map_entry_point();
             city->trader_figure_ids[index] = figure_create_trade_caravan(entry->x, entry->y, city_id);
+#ifdef ENABLE_MULTIPLAYER
+            if (net_session_is_active() && city->trader_figure_ids[index] > 0) {
+                int owner_pid = empire_city_is_player_owned(city_id)
+                    ? empire_city_get_owner_player_id(city_id)
+                    : 0;
+                mp_ownership_set_trader(city->trader_figure_ids[index], (uint8_t)(owner_pid >= 0 ? owner_pid : 0),
+                    city_id, selected_route.counterpart_city_id, selected_route.route_id);
+                if (net_session_is_host()) {
+                    mp_trade_sync_emit_trader_spawned(city->trader_figure_ids[index], city_id, selected_route.route_id);
+                }
+            }
+#endif
             return 1;
         }
     }
@@ -521,19 +661,6 @@ void empire_city_generate_trader(void)
     array_foreach(cities, city) {
         if (!city->in_use || !city->is_open) {
             continue;
-        }
-        if (city->is_sea_trade) {
-            if (!city_buildings_has_working_dock()) {
-                // delay of 384 = 1 year
-                city_message_post_with_message_delay(MESSAGE_CAT_NO_WORKING_DOCK, 1, MESSAGE_NO_WORKING_DOCK, 384);
-                continue;
-            }
-            if (!scenario_map_has_river_entry()) {
-                continue;
-            }
-            city_trade_add_sea_trade_route();
-        } else {
-            city_trade_add_land_trade_route();
         }
         generate_trader(array_index, city);
     }

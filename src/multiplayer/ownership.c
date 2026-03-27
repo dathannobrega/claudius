@@ -29,6 +29,8 @@ typedef struct {
     mp_route_state state;
     uint8_t origin_player_id;
     uint8_t dest_player_id;
+    int origin_city_id;
+    int dest_city_id;
     uint32_t network_route_id;
     uint32_t route_state_version;
     uint32_t authoritative_open_tick;
@@ -206,6 +208,7 @@ static route_ownership *alloc_route_entry(int route_id)
 
 int mp_ownership_create_route(int route_id, mp_route_owner_mode mode,
                                uint8_t origin_player_id, uint8_t dest_player_id,
+                               int origin_city_id, int dest_city_id,
                                uint32_t network_route_id)
 {
     route_ownership *entry = alloc_route_entry(route_id);
@@ -216,6 +219,8 @@ int mp_ownership_create_route(int route_id, mp_route_owner_mode mode,
     entry->state = MP_ROUTE_STATE_PENDING;
     entry->origin_player_id = origin_player_id;
     entry->dest_player_id = dest_player_id;
+    entry->origin_city_id = origin_city_id;
+    entry->dest_city_id = dest_city_id;
     entry->network_route_id = network_route_id;
     entry->route_state_version = 1;
     entry->authoritative_open_tick = 0;
@@ -275,6 +280,18 @@ uint8_t mp_ownership_get_route_dest_player(int route_id)
     return entry ? entry->dest_player_id : 0;
 }
 
+int mp_ownership_get_route_origin_city(int route_id)
+{
+    route_ownership *entry = find_route_entry(route_id);
+    return entry ? entry->origin_city_id : -1;
+}
+
+int mp_ownership_get_route_dest_city(int route_id)
+{
+    route_ownership *entry = find_route_entry(route_id);
+    return entry ? entry->dest_city_id : -1;
+}
+
 int mp_ownership_is_route_player_to_player(int route_id)
 {
     route_ownership *entry = find_route_entry(route_id);
@@ -322,14 +339,8 @@ int mp_ownership_find_route_between(int city_a, int city_b)
         if (!r->in_use || r->state == MP_ROUTE_STATE_DELETED) {
             continue;
         }
-        /* Check city ownership to find the route */
-        city_ownership *ca = find_city_entry(city_a);
-        city_ownership *cb = find_city_entry(city_b);
-        if (!ca || !cb) {
-            continue;
-        }
-        if ((r->origin_player_id == ca->player_id && r->dest_player_id == cb->player_id) ||
-            (r->origin_player_id == cb->player_id && r->dest_player_id == ca->player_id)) {
+        if ((r->origin_city_id == city_a && r->dest_city_id == city_b) ||
+            (r->origin_city_id == city_b && r->dest_city_id == city_a)) {
             return r->route_id;
         }
     }
@@ -629,6 +640,8 @@ void mp_ownership_serialize(uint8_t *buffer, uint32_t *size)
         net_write_u8(&s, (uint8_t)r->state);
         net_write_u8(&s, r->origin_player_id);
         net_write_u8(&s, r->dest_player_id);
+        net_write_i32(&s, r->origin_city_id);
+        net_write_i32(&s, r->dest_city_id);
         net_write_u32(&s, r->network_route_id);
         net_write_u32(&s, r->route_state_version);
         net_write_u32(&s, r->authoritative_open_tick);
@@ -688,11 +701,13 @@ void mp_ownership_deserialize(const uint8_t *buffer, uint32_t size)
         mp_route_state state = (mp_route_state)net_read_u8(&s);
         uint8_t origin = net_read_u8(&s);
         uint8_t dest = net_read_u8(&s);
+        int origin_city = net_read_i32(&s);
+        int dest_city = net_read_i32(&s);
         uint32_t net_id = net_read_u32(&s);
         uint32_t version = net_read_u32(&s);
         uint32_t open_tick = net_read_u32(&s);
 
-        mp_ownership_create_route(route_id, mode, origin, dest, net_id);
+        mp_ownership_create_route(route_id, mode, origin, dest, origin_city, dest_city, net_id);
         mp_ownership_set_route_state(route_id, state);
 
         route_ownership *entry = find_route_entry(route_id);

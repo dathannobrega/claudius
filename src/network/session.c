@@ -62,6 +62,138 @@ static uint32_t generate_session_id(void)
     return (uint32_t)rand() ^ ((uint32_t)rand() << 16);
 }
 
+static int uuid_is_nonzero(const uint8_t *uuid, size_t size)
+{
+    if (!uuid) {
+        return 0;
+    }
+    for (size_t i = 0; i < size; i++) {
+        if (uuid[i] != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int find_peer_index(const net_peer *peer)
+{
+    if (!peer) {
+        return -1;
+    }
+    for (int i = 0; i < NET_MAX_PEERS; i++) {
+        if (&session.peers[i] == peer) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void copy_current_world_uuid(uint8_t *out_uuid)
+{
+    const mp_game_manifest *manifest = mp_game_manifest_get();
+    if (!out_uuid) {
+        return;
+    }
+    memset(out_uuid, 0, MP_WORLD_UUID_SIZE);
+    if (manifest && manifest->valid) {
+        memcpy(out_uuid, manifest->world_instance_uuid, MP_WORLD_UUID_SIZE);
+    }
+}
+
+static uint32_t current_resume_generation(void)
+{
+    return session.session_id;
+}
+
+static int has_reconnectable_player(void)
+{
+    for (int i = 0; i < MP_MAX_PLAYERS; i++) {
+        mp_player *player = mp_player_registry_get((uint8_t)i);
+        if (!player || !player->active) {
+            continue;
+        }
+        if (player->status == MP_PLAYER_AWAITING_RECONNECT ||
+            player->status == MP_PLAYER_DISCONNECTED ||
+            player->connection_state == MP_CONNECTION_DISCONNECTED) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static net_discovery_session_phase current_discovery_phase(void)
+{
+    if (session.state == NET_SESSION_HOSTING_GAME) {
+        return NET_DISCOVERY_PHASE_IN_GAME;
+    }
+    if (session.state == NET_SESSION_HOSTING_LOBBY) {
+        if (mp_bootstrap_is_resume()) {
+            return NET_DISCOVERY_PHASE_RESUME_LOBBY;
+        }
+        return NET_DISCOVERY_PHASE_LOBBY;
+    }
+    return NET_DISCOVERY_PHASE_LOBBY;
+}
+
+static net_discovery_join_policy current_discovery_join_policy(void)
+{
+    if (session.state == NET_SESSION_HOSTING_LOBBY) {
+        if (mp_bootstrap_is_resume()) {
+            return NET_DISCOVERY_JOIN_RECONNECT_ONLY;
+        }
+        return NET_DISCOVERY_JOIN_OPEN_LOBBY;
+    }
+
+    if (session.state == NET_SESSION_HOSTING_GAME) {
+        if (mp_bootstrap_is_late_join_busy()) {
+            return NET_DISCOVERY_JOIN_CLOSED;
+        }
+        if (mp_worldgen_get_reserved_count() > 0) {
+            return NET_DISCOVERY_JOIN_LATE_JOIN_ALLOWED;
+        }
+        if (has_reconnectable_player()) {
+            return NET_DISCOVERY_JOIN_RECONNECT_ONLY;
+        }
+    }
+
+    return NET_DISCOVERY_JOIN_CLOSED;
+}
+
+static void build_discovery_announcement(net_discovery_announcement *announcement)
+{
+    const mp_game_manifest *manifest = mp_game_manifest_get();
+    uint8_t player_count = (uint8_t)mp_player_registry_get_count();
+    uint8_t max_players = NET_MAX_PLAYERS;
+
+    if (!announcement) {
+        return;
+    }
+    memset(announcement, 0, sizeof(*announcement));
+
+    strncpy(announcement->host_name, session.local_player_name,
+            sizeof(announcement->host_name) - 1);
+    announcement->game_port = session.port;
+    announcement->player_count = player_count > 0 ? player_count : 1;
+    if (manifest && manifest->valid) {
+        if (manifest->max_players > 0) {
+            max_players = manifest->max_players;
+        }
+        if (session.role == NET_ROLE_HOST) {
+            mp_game_manifest_set_player_count(announcement->player_count);
+        }
+        memcpy(announcement->world_instance_uuid,
+               manifest->world_instance_uuid,
+               MP_WORLD_UUID_SIZE);
+    }
+    announcement->max_players = max_players;
+    announcement->session_id = session.session_id;
+    announcement->protocol_version = NET_PROTOCOL_VERSION;
+    announcement->session_phase = (uint8_t)current_discovery_phase();
+    announcement->join_policy = (uint8_t)current_discovery_join_policy();
+    announcement->reserved_slots_free = (uint8_t)mp_worldgen_get_reserved_count();
+    announcement->resume_generation = current_resume_generation();
+}
+
 static int find_free_peer_slot(void)
 {
     for (int i = 0; i < NET_MAX_PEERS; i++) {
@@ -114,6 +246,7 @@ static void broadcast_lobby_snapshot(void)
     uint32_t snapshot_size = 0;
     mp_player_registry_serialize(snapshot_buf, &snapshot_size);
     net_session_broadcast_lobby(NET_MSG_LOBBY_SNAPSHOT, snapshot_buf, snapshot_size);
+    net_session_refresh_discovery_announcement();
 }
 
 static void broadcast_full_snapshot_to_in_game_peers(void)
@@ -227,6 +360,70 @@ static void send_raw_to_peer(net_peer *peer, uint16_t message_type,
     peer->packets_sent++;
 }
 
+static void send_join_accept_to_peer(net_peer *peer, uint8_t player_id, uint8_t slot_id,
+                                     const uint8_t *player_uuid,
+                                     const uint8_t *reconnect_token,
+                                     uint8_t player_count,
+                                     uint32_t session_seed)
+{
+    uint8_t accept_world_uuid[MP_WORLD_UUID_SIZE];
+    uint8_t accept_buf[160];
+    net_serializer as;
+
+    copy_current_world_uuid(accept_world_uuid);
+
+    net_serializer_init(&as, accept_buf, sizeof(accept_buf));
+    net_write_u8(&as, player_id);
+    net_write_u8(&as, slot_id);
+    net_write_u32(&as, session.session_id);
+    net_write_u32(&as, session_seed);
+    net_write_u8(&as, player_count);
+    if (player_uuid) {
+        net_write_raw(&as, player_uuid, MP_PLAYER_UUID_SIZE);
+    } else {
+        uint8_t zeros[MP_PLAYER_UUID_SIZE] = {0};
+        net_write_raw(&as, zeros, MP_PLAYER_UUID_SIZE);
+    }
+    if (reconnect_token) {
+        net_write_raw(&as, reconnect_token, MP_RECONNECT_TOKEN_SIZE);
+    } else {
+        uint8_t zeros[MP_RECONNECT_TOKEN_SIZE] = {0};
+        net_write_raw(&as, zeros, MP_RECONNECT_TOKEN_SIZE);
+    }
+    net_write_raw(&as, accept_world_uuid, MP_WORLD_UUID_SIZE);
+    net_write_u32(&as, current_resume_generation());
+    send_raw_to_peer(peer, NET_MSG_JOIN_ACCEPT, accept_buf,
+                     (uint32_t)net_serializer_position(&as));
+}
+
+static void reject_peer(net_peer *peer, uint8_t reason, const char *log_context)
+{
+    int peer_index;
+    uint8_t reject_buf[2];
+    net_serializer rs;
+
+    if (!peer) {
+        return;
+    }
+
+    net_serializer_init(&rs, reject_buf, sizeof(reject_buf));
+    net_write_u8(&rs, reason);
+    send_raw_to_peer(peer, NET_MSG_JOIN_REJECT, reject_buf,
+                     (uint32_t)net_serializer_position(&rs));
+
+    MP_LOG_WARN("HANDSHAKE", "JOIN_REJECT sent: peer='%s' reason=%d context=%s",
+                peer->name[0] ? peer->name : "<pending>", (int)reason,
+                log_context ? log_context : "n/a");
+
+    peer_index = find_peer_index(peer);
+    if (peer_index >= 0) {
+        close_peer(peer_index);
+    } else if (peer->socket_fd >= 0) {
+        net_tcp_close(peer->socket_fd);
+        net_peer_reset(peer);
+    }
+}
+
 static int try_reconnect_player(net_peer *peer, const uint8_t *uuid,
                                 const uint8_t *reconnect_token)
 {
@@ -248,18 +445,13 @@ static int try_reconnect_player(net_peer *peer, const uint8_t *uuid,
 
     /* Reconnect the player */
     uint8_t old_player_id = existing->player_id;
-    int peer_index = -1;
-    for (int i = 0; i < NET_MAX_PEERS; i++) {
-        if (&session.peers[i] == peer) {
-            peer_index = i;
-            break;
-        }
-    }
+    int peer_index = find_peer_index(peer);
     if (peer_index < 0) {
         return 0;
     }
 
     mp_player_registry_handle_reconnect(uuid, (uint8_t)peer_index);
+    mp_player_registry_set_connection_state(old_player_id, MP_CONNECTION_CONNECTED);
 
     /* Restore routes */
     mp_ownership_set_player_routes_online(old_player_id);
@@ -277,19 +469,10 @@ static int try_reconnect_player(net_peer *peer, const uint8_t *uuid,
 
     log_info("Player reconnected", existing->name, (int)old_player_id);
 
-    /* Send JOIN_ACCEPT with reconnect info */
-    uint8_t accept_buf[128];
-    net_serializer as;
-    net_serializer_init(&as, accept_buf, sizeof(accept_buf));
-    net_write_u8(&as, old_player_id);
-    net_write_u8(&as, existing->slot_id);
-    net_write_u32(&as, session.session_id);
-    net_write_u32(&as, mp_worldgen_get_spawn_table_mutable()->session_seed);
-    net_write_u8(&as, (uint8_t)(session.peer_count + 1));
-    net_write_raw(&as, existing->player_uuid, MP_PLAYER_UUID_SIZE);
-    net_write_raw(&as, existing->reconnect_token, MP_RECONNECT_TOKEN_SIZE);
-    send_raw_to_peer(peer, NET_MSG_JOIN_ACCEPT, accept_buf,
-                     (uint32_t)net_serializer_position(&as));
+    send_join_accept_to_peer(peer, old_player_id, existing->slot_id,
+                             existing->player_uuid, existing->reconnect_token,
+                             (uint8_t)mp_player_registry_get_count(),
+                             mp_worldgen_get_spawn_table_mutable()->session_seed);
 
     {
         uint8_t event_buf[32];
@@ -305,12 +488,311 @@ static int try_reconnect_player(net_peer *peer, const uint8_t *uuid,
     /* Send full snapshot to reconnecting player so they can resync */
     extern void multiplayer_resync_handle_request(uint8_t player_id);
     multiplayer_resync_handle_request(old_player_id);
+    net_session_refresh_discovery_announcement();
 
     return 1;
 }
 
+static void handle_hello_impl(net_peer *peer, const uint8_t *payload, uint32_t size)
+{
+    net_serializer s;
+    uint32_t magic;
+    uint16_t version;
+    uint32_t save_version = 0;
+    uint32_t map_hash = 0;
+    uint32_t scenario_hash = 0;
+    uint32_t feature_flags = 0;
+    char name[NET_MAX_PLAYER_NAME];
+    uint8_t player_uuid[MP_PLAYER_UUID_SIZE];
+    uint8_t reconnect_token[MP_RECONNECT_TOKEN_SIZE];
+    uint8_t requested_slot_id = 0xFF;
+    uint8_t requested_world_uuid[MP_WORLD_UUID_SIZE];
+    uint32_t requested_resume_generation = 0;
+    uint8_t current_world_uuid[MP_WORLD_UUID_SIZE];
+    int peer_index;
+    int has_uuid;
+    int reserved_slots;
+    mp_player *existing;
+
+    memset(name, 0, sizeof(name));
+    memset(player_uuid, 0, sizeof(player_uuid));
+    memset(reconnect_token, 0, sizeof(reconnect_token));
+    memset(requested_world_uuid, 0, sizeof(requested_world_uuid));
+    copy_current_world_uuid(current_world_uuid);
+
+    if (!peer || !payload || size < 6) {
+        MP_LOG_ERROR("HANDSHAKE", "HELLO too small: %u bytes", size);
+        reject_peer(peer, NET_REJECT_INTERNAL_ERROR, "hello_too_small");
+        return;
+    }
+
+    net_serializer_init(&s, (uint8_t *)payload, size);
+    magic = net_read_u32(&s);
+    version = net_read_u16(&s);
+
+    if (net_serializer_has_overflow(&s)) {
+        reject_peer(peer, NET_REJECT_INTERNAL_ERROR, "hello_header_overflow");
+        return;
+    }
+
+    if (net_serializer_remaining(&s) >= (size_t)(sizeof(uint32_t) * 4 +
+                                                 NET_MAX_PLAYER_NAME +
+                                                 MP_PLAYER_UUID_SIZE +
+                                                 MP_RECONNECT_TOKEN_SIZE)) {
+        save_version = net_read_u32(&s);
+        map_hash = net_read_u32(&s);
+        scenario_hash = net_read_u32(&s);
+        feature_flags = net_read_u32(&s);
+        net_read_raw(&s, name, NET_MAX_PLAYER_NAME);
+        net_read_raw(&s, player_uuid, MP_PLAYER_UUID_SIZE);
+        net_read_raw(&s, reconnect_token, MP_RECONNECT_TOKEN_SIZE);
+    } else if (net_serializer_remaining(&s) >= NET_MAX_PLAYER_NAME) {
+        net_read_raw(&s, name, NET_MAX_PLAYER_NAME);
+    } else {
+        reject_peer(peer, NET_REJECT_INTERNAL_ERROR, "hello_name_missing");
+        return;
+    }
+
+    if (net_serializer_remaining(&s) >= 1) {
+        requested_slot_id = net_read_u8(&s);
+    }
+    if (net_serializer_remaining(&s) >= MP_WORLD_UUID_SIZE) {
+        net_read_raw(&s, requested_world_uuid, MP_WORLD_UUID_SIZE);
+    }
+    if (net_serializer_remaining(&s) >= sizeof(uint32_t)) {
+        requested_resume_generation = net_read_u32(&s);
+    }
+
+    if (net_serializer_has_overflow(&s)) {
+        MP_LOG_ERROR("HANDSHAKE", "Malformed HELLO: payload size=%u", size);
+        reject_peer(peer, NET_REJECT_INTERNAL_ERROR, "hello_malformed");
+        return;
+    }
+
+    name[NET_MAX_PLAYER_NAME - 1] = '\0';
+    {
+        int len = (int)strlen(name);
+        while (len > 0 && name[len - 1] == ' ') {
+            name[--len] = '\0';
+        }
+        if (len == 0) {
+            strncpy(name, "Unknown", NET_MAX_PLAYER_NAME - 1);
+            name[NET_MAX_PLAYER_NAME - 1] = '\0';
+        }
+    }
+
+    strncpy(peer->name, name, NET_MAX_PLAYER_NAME - 1);
+    peer->name[NET_MAX_PLAYER_NAME - 1] = '\0';
+
+    MP_LOG_INFO("HANDSHAKE", "HELLO received: name='%s' magic=0x%08x version=%d "
+                "save_ver=%u map_hash=0x%08x scenario_hash=0x%08x flags=0x%08x "
+                "slot=%d resume_gen=%u",
+                name, magic, (int)version, save_version, map_hash, scenario_hash,
+                feature_flags, (int)requested_slot_id, requested_resume_generation);
+
+    if (magic != NET_MAGIC || !net_protocol_check_version(version)) {
+        reject_peer(peer, NET_REJECT_VERSION_MISMATCH, "protocol_mismatch");
+        return;
+    }
+
+    peer_index = find_peer_index(peer);
+    has_uuid = uuid_is_nonzero(player_uuid, MP_PLAYER_UUID_SIZE);
+    existing = has_uuid ? mp_player_registry_get_by_uuid(player_uuid) : NULL;
+    reserved_slots = mp_worldgen_get_reserved_count();
+
+    if (session.state == NET_SESSION_HOSTING_LOBBY && mp_bootstrap_is_resume()) {
+        uint8_t old_player_id;
+
+        if (!has_uuid) {
+            reject_peer(peer, NET_REJECT_RECONNECT_REQUIRED, "resume_requires_identity");
+            return;
+        }
+        if (uuid_is_nonzero(requested_world_uuid, MP_WORLD_UUID_SIZE) &&
+            uuid_is_nonzero(current_world_uuid, MP_WORLD_UUID_SIZE) &&
+            memcmp(requested_world_uuid, current_world_uuid, MP_WORLD_UUID_SIZE) != 0) {
+            reject_peer(peer, NET_REJECT_WORLD_MISMATCH, "resume_world_mismatch");
+            return;
+        }
+        if (requested_resume_generation != 0 &&
+            current_resume_generation() != 0 &&
+            requested_resume_generation != current_resume_generation()) {
+            reject_peer(peer, NET_REJECT_RESUME_GENERATION_MISMATCH,
+                        "resume_generation_mismatch");
+            return;
+        }
+        if (!existing || !existing->active) {
+            reject_peer(peer, NET_REJECT_SLOT_NOT_FOUND, "resume_uuid_not_found");
+            return;
+        }
+        if (requested_slot_id != 0xFF && existing->slot_id != requested_slot_id) {
+            reject_peer(peer, NET_REJECT_SLOT_NOT_FOUND, "resume_slot_mismatch");
+            return;
+        }
+        if ((existing->status != MP_PLAYER_AWAITING_RECONNECT &&
+             existing->status != MP_PLAYER_DISCONNECTED) ||
+            !mp_player_registry_validate_reconnect(player_uuid, reconnect_token)) {
+            reject_peer(peer, NET_REJECT_RECONNECT_REQUIRED, "resume_token_invalid");
+            return;
+        }
+        if (peer_index < 0) {
+            reject_peer(peer, NET_REJECT_INTERNAL_ERROR, "resume_missing_peer_index");
+            return;
+        }
+
+        old_player_id = existing->player_id;
+        mp_player_registry_handle_reconnect(player_uuid, (uint8_t)peer_index);
+        mp_player_registry_set_status(old_player_id, MP_PLAYER_LOBBY);
+        mp_player_registry_set_connection_state(old_player_id, MP_CONNECTION_CONNECTED);
+
+        strncpy(peer->name, existing->name, NET_MAX_PLAYER_NAME - 1);
+        peer->name[NET_MAX_PLAYER_NAME - 1] = '\0';
+        net_peer_set_player_id(peer, old_player_id);
+        peer->state = PEER_STATE_JOINED;
+
+        if (existing->assigned_city_id >= 0) {
+            mp_ownership_set_city_online(existing->assigned_city_id, 1);
+        }
+        mp_ownership_set_player_routes_online(old_player_id);
+
+        send_join_accept_to_peer(peer, old_player_id, existing->slot_id,
+                                 existing->player_uuid, existing->reconnect_token,
+                                 (uint8_t)mp_player_registry_get_count(),
+                                 mp_worldgen_get_spawn_table_mutable()->session_seed);
+        broadcast_lobby_snapshot();
+        return;
+    }
+
+    if (session.state == NET_SESSION_HOSTING_GAME) {
+        int reconnect_candidate = existing && existing->active &&
+            (existing->status == MP_PLAYER_AWAITING_RECONNECT ||
+             existing->status == MP_PLAYER_DISCONNECTED ||
+             existing->connection_state == MP_CONNECTION_DISCONNECTED);
+
+        if (reconnect_candidate) {
+            if (uuid_is_nonzero(requested_world_uuid, MP_WORLD_UUID_SIZE) &&
+                uuid_is_nonzero(current_world_uuid, MP_WORLD_UUID_SIZE) &&
+                memcmp(requested_world_uuid, current_world_uuid, MP_WORLD_UUID_SIZE) != 0) {
+                reject_peer(peer, NET_REJECT_WORLD_MISMATCH, "game_world_mismatch");
+                return;
+            }
+            if (requested_resume_generation != 0 &&
+                current_resume_generation() != 0 &&
+                requested_resume_generation != current_resume_generation()) {
+                reject_peer(peer, NET_REJECT_RESUME_GENERATION_MISMATCH,
+                            "game_generation_mismatch");
+                return;
+            }
+            if (requested_slot_id != 0xFF && existing->slot_id != requested_slot_id) {
+                reject_peer(peer, NET_REJECT_SLOT_NOT_FOUND, "game_slot_mismatch");
+                return;
+            }
+            if (try_reconnect_player(peer, player_uuid, reconnect_token)) {
+                return;
+            }
+            reject_peer(peer, NET_REJECT_RECONNECT_REQUIRED, "game_reconnect_failed");
+            return;
+        }
+        if (has_uuid && existing && existing->active) {
+            reject_peer(peer, NET_REJECT_RECONNECT_REQUIRED, "identity_already_active");
+            return;
+        }
+
+        if (mp_bootstrap_is_late_join_busy()) {
+            reject_peer(peer, NET_REJECT_LATE_JOIN_BUSY, "late_join_busy");
+            return;
+        }
+        if (reserved_slots > 0) {
+            uint8_t late_join_reject_reason = NET_REJECT_INTERNAL_ERROR;
+
+            if (peer_index < 0) {
+                reject_peer(peer, NET_REJECT_INTERNAL_ERROR, "late_join_missing_peer_index");
+                return;
+            }
+            if (mp_bootstrap_host_handle_late_join((uint8_t)peer_index, name,
+                                                   &late_join_reject_reason)) {
+                net_session_refresh_discovery_announcement();
+                return;
+            }
+            reject_peer(peer, late_join_reject_reason, "late_join_rejected");
+            return;
+        }
+        if (has_reconnectable_player()) {
+            reject_peer(peer, NET_REJECT_RECONNECT_REQUIRED, "reconnect_only");
+            return;
+        }
+        reject_peer(peer, NET_REJECT_GAME_IN_PROGRESS, "game_closed");
+        return;
+    }
+
+    for (int i = 0; i < NET_MAX_PEERS; i++) {
+        if (session.peers[i].active && session.peers[i].player_id != peer->player_id &&
+            strncmp(session.peers[i].name, name, NET_MAX_PLAYER_NAME - 1) == 0) {
+            reject_peer(peer, NET_REJECT_NAME_TAKEN, "duplicate_peer_name");
+            return;
+        }
+    }
+    if (strncmp(session.local_player_name, name, NET_MAX_PLAYER_NAME - 1) == 0) {
+        reject_peer(peer, NET_REJECT_NAME_TAKEN, "duplicate_host_name");
+        return;
+    }
+
+    {
+        uint8_t new_player_id = 0;
+        int slot;
+        mp_player *new_player;
+        uint32_t now = net_tcp_get_timestamp_ms();
+        uint32_t session_seed = mp_worldgen_get_spawn_table_mutable()->session_seed;
+
+        for (int i = 1; i < MP_MAX_PLAYERS; i++) {
+            mp_player *candidate = mp_player_registry_get((uint8_t)i);
+            if (!candidate || !candidate->active) {
+                new_player_id = (uint8_t)i;
+                break;
+            }
+        }
+        if (new_player_id == 0) {
+            reject_peer(peer, NET_REJECT_SESSION_FULL, "lobby_full");
+            return;
+        }
+
+        if (!mp_player_registry_add(new_player_id, name, 0, 0)) {
+            reject_peer(peer, NET_REJECT_INTERNAL_ERROR, "registry_add_failed");
+            return;
+        }
+
+        slot = mp_player_registry_assign_slot(new_player_id);
+        if (slot < 0) {
+            mp_player_registry_remove(new_player_id);
+            reject_peer(peer, NET_REJECT_SESSION_FULL, "slot_assign_failed");
+            return;
+        }
+
+        net_peer_set_player_id(peer, new_player_id);
+        peer->state = PEER_STATE_JOINED;
+        peer->last_heartbeat_recv_ms = now;
+
+        mp_player_registry_set_status(new_player_id, MP_PLAYER_LOBBY);
+        mp_player_registry_set_connection_state(new_player_id, MP_CONNECTION_CONNECTED);
+
+        new_player = mp_player_registry_get(new_player_id);
+        send_join_accept_to_peer(peer, new_player_id, (uint8_t)slot,
+                                 new_player ? new_player->player_uuid : NULL,
+                                 new_player ? new_player->reconnect_token : NULL,
+                                 (uint8_t)mp_player_registry_get_count(),
+                                 session_seed);
+
+        MP_LOG_INFO("HANDSHAKE", "JOIN_ACCEPT sent: player_id=%d slot=%d session=0x%08x seed=%u",
+                    (int)new_player_id, slot, session.session_id, session_seed);
+        log_info("Player joined", name, (int)new_player_id);
+        broadcast_lobby_snapshot();
+    }
+}
+
 static void handle_hello(net_peer *peer, const uint8_t *payload, uint32_t size)
 {
+    handle_hello_impl(peer, payload, size);
+    return;
+#if 0
     /* Minimum HELLO size: magic(4) + version(2) + name(32) = 38 bytes */
     if (size < 38) {
         MP_LOG_ERROR("HANDSHAKE", "HELLO too small: %u bytes (minimum 38)", size);
@@ -596,6 +1078,7 @@ static void handle_hello(net_peer *peer, const uint8_t *payload, uint32_t size)
                 (int)new_player_id, slot, session.session_id, session_seed);
 
     broadcast_lobby_snapshot();
+#endif
 }
 
 static void handle_chat_from_client(net_peer *peer, const uint8_t *payload, uint32_t size)
@@ -833,6 +1316,8 @@ static void handle_host_message(const net_packet_header *header,
     switch (header->message_type) {
         case NET_MSG_JOIN_ACCEPT: {
             net_serializer s;
+            uint8_t accept_world_uuid[MP_WORLD_UUID_SIZE];
+            uint32_t accept_resume_generation = 0;
             net_serializer_init(&s, (uint8_t *)payload, size);
             session.local_player_id = net_read_u8(&s);
             uint8_t slot_id = net_read_u8(&s);
@@ -843,6 +1328,20 @@ static void handle_host_message(const net_packet_header *header,
             uint8_t assigned_token[16];
             net_read_raw(&s, assigned_uuid, 16);
             net_read_raw(&s, assigned_token, 16);
+            memset(accept_world_uuid, 0, sizeof(accept_world_uuid));
+            if (net_serializer_remaining(&s) >= MP_WORLD_UUID_SIZE) {
+                net_read_raw(&s, accept_world_uuid, MP_WORLD_UUID_SIZE);
+            }
+            if (net_serializer_remaining(&s) >= sizeof(uint32_t)) {
+                accept_resume_generation = net_read_u32(&s);
+            }
+            if (net_serializer_has_overflow(&s)) {
+                MP_LOG_ERROR("HANDSHAKE", "[join:%04x] Malformed JOIN_ACCEPT payload",
+                             join_correlation_id);
+                join_status = NET_JOIN_STATUS_FAILED;
+                session.state = NET_SESSION_DISCONNECTING;
+                break;
+            }
 
             session.host_peer.state = PEER_STATE_JOINED;
             session.state = NET_SESSION_CLIENT_LOBBY;
@@ -870,13 +1369,13 @@ static void handle_host_message(const net_packet_header *header,
 
             /* Persist identity to disk for reconnect after app restart */
             {
-                const mp_game_manifest *manifest = mp_game_manifest_get();
-                const uint8_t *world_uuid = manifest ? manifest->world_instance_uuid : NULL;
                 mp_client_identity_set(assigned_uuid, assigned_token,
-                                        world_uuid,
+                                        slot_id,
+                                        accept_world_uuid,
                                         NULL, 0, /* host address/port not available here */
                                         session.local_player_name,
-                                        session.session_id);
+                                        session.session_id,
+                                        accept_resume_generation);
                 mp_client_identity_save();
             }
 
@@ -900,6 +1399,15 @@ static void handle_host_message(const net_packet_header *header,
                     case NET_REJECT_GAME_IN_PROGRESS: reason_str = "GAME_IN_PROGRESS"; break;
                     case NET_REJECT_NAME_TAKEN: reason_str = "NAME_TAKEN"; break;
                     case NET_REJECT_BANNED: reason_str = "BANNED"; break;
+                    case NET_REJECT_NO_RESERVED_SLOTS: reason_str = "NO_RESERVED_SLOTS"; break;
+                    case NET_REJECT_LATE_JOIN_BUSY: reason_str = "LATE_JOIN_BUSY"; break;
+                    case NET_REJECT_RECONNECT_REQUIRED: reason_str = "RECONNECT_REQUIRED"; break;
+                    case NET_REJECT_SLOT_NOT_FOUND: reason_str = "SLOT_NOT_FOUND"; break;
+                    case NET_REJECT_WORLD_MISMATCH: reason_str = "WORLD_MISMATCH"; break;
+                    case NET_REJECT_RESUME_GENERATION_MISMATCH:
+                        reason_str = "RESUME_GENERATION_MISMATCH";
+                        break;
+                    case NET_REJECT_INTERNAL_ERROR: reason_str = "INTERNAL_ERROR"; break;
                 }
                 MP_LOG_ERROR("HANDSHAKE", "[join:%04x] JOIN_REJECT received: reason=%s (%d)",
                              join_correlation_id, reason_str, (int)reason);
@@ -1058,9 +1566,11 @@ static void host_accept_connections(void)
 
     int slot = find_free_peer_slot();
     if (slot < 0) {
-        /* Session full */
+        net_peer temp_peer;
+        net_peer_init(&temp_peer);
+        net_peer_set_connected(&temp_peer, client_fd, "Pending");
         log_error("Session full, rejecting connection", 0, 0);
-        net_tcp_close(client_fd);
+        reject_peer(&temp_peer, NET_REJECT_SESSION_FULL, "accept_connection_full");
         return;
     }
 
@@ -1203,6 +1713,7 @@ int net_session_init(void)
     memset(&session, 0, sizeof(net_session));
     memset(&chat_history, 0, sizeof(chat_history));
     mp_player_registry_clear();
+    mp_client_identity_init();
     join_status = NET_JOIN_STATUS_NONE;
     join_reject_reason = 0;
     join_start_ms = 0;
@@ -1250,6 +1761,8 @@ void net_session_shutdown(void)
 
 int net_session_host(const char *player_name, uint16_t port)
 {
+    net_discovery_announcement announcement;
+
     if (session.state != NET_SESSION_IDLE) {
         log_error("Cannot host: session not idle", 0, 0);
         return 0;
@@ -1282,7 +1795,8 @@ int net_session_host(const char *player_name, uint16_t port)
     mp_player_registry_assign_slot(0);
 
     /* Start LAN discovery broadcasting so clients can find this host */
-    net_discovery_start_announcing(player_name, port, 1, NET_MAX_PLAYERS, session.session_id);
+    build_discovery_announcement(&announcement);
+    net_discovery_start_announcing(&announcement);
 
     log_info("Hosting session", player_name, (int)port);
     MP_LOG_INFO("SESSION", "Hosting session: name='%s' port=%d session_id=0x%08x",
@@ -1369,11 +1883,21 @@ int net_session_join(const char *player_name, const char *host_address, uint16_t
     {
         uint8_t hello_uuid[16] = {0};
         uint8_t hello_token[16] = {0};
+        uint8_t hello_world_uuid[MP_WORLD_UUID_SIZE] = {0};
+        uint8_t hello_slot_id = 0xFF;
+        uint32_t hello_resume_generation = 0;
         int have_identity = 0;
+        const mp_client_identity *identity = NULL;
 
         /* Priority 1: persisted identity file */
         if (mp_client_identity_load()) {
             have_identity = mp_client_identity_get_for_hello(hello_uuid, hello_token);
+            identity = mp_client_identity_get();
+            if (have_identity && identity) {
+                hello_slot_id = identity->slot_id;
+                memcpy(hello_world_uuid, identity->world_instance_uuid, MP_WORLD_UUID_SIZE);
+                hello_resume_generation = identity->resume_generation;
+            }
         }
 
         /* Priority 2: in-memory player registry (same session, no restart) */
@@ -1382,12 +1906,18 @@ int net_session_join(const char *player_name, const char *host_address, uint16_t
             if (local && local->active) {
                 memcpy(hello_uuid, local->player_uuid, 16);
                 memcpy(hello_token, local->reconnect_token, 16);
+                hello_slot_id = local->slot_id;
+                copy_current_world_uuid(hello_world_uuid);
+                hello_resume_generation = current_resume_generation();
                 have_identity = 1;
             }
         }
 
         net_write_raw(&s, hello_uuid, 16);
         net_write_raw(&s, hello_token, 16);
+        net_write_u8(&s, hello_slot_id);
+        net_write_raw(&s, hello_world_uuid, MP_WORLD_UUID_SIZE);
+        net_write_u32(&s, hello_resume_generation);
     }
 
     net_session_send_to_host(NET_MSG_HELLO, hello_buf, (uint32_t)net_serializer_position(&s));
@@ -1403,6 +1933,16 @@ int net_session_join(const char *player_name, const char *host_address, uint16_t
 
 void net_session_disconnect(void)
 {
+    net_join_status preserved_join_status = NET_JOIN_STATUS_NONE;
+    uint8_t preserved_reject_reason = 0;
+
+    if (join_status == NET_JOIN_STATUS_REJECTED ||
+        join_status == NET_JOIN_STATUS_TIMEOUT ||
+        join_status == NET_JOIN_STATUS_FAILED) {
+        preserved_join_status = join_status;
+        preserved_reject_reason = join_reject_reason;
+    }
+
     if (session.state == NET_SESSION_IDLE) {
         return;
     }
@@ -1455,17 +1995,31 @@ void net_session_disconnect(void)
     session.state = NET_SESSION_IDLE;
     session.role = NET_ROLE_NONE;
     session.peer_count = 0;
-    join_status = NET_JOIN_STATUS_NONE;
-    join_reject_reason = 0;
+    join_status = preserved_join_status;
+    join_reject_reason = preserved_reject_reason;
     join_start_ms = 0;
     memset(&chat_history, 0, sizeof(chat_history));
     mp_player_registry_clear();
 
-    /* Clear persisted client identity on explicit disconnect */
-    mp_client_identity_clear();
+    /* Clear persisted identity only on real session teardown, not failed joins. */
+    if (preserved_join_status == NET_JOIN_STATUS_NONE) {
+        mp_client_identity_clear();
+    }
 
     log_info("Session disconnected", 0, 0);
     MP_LOG_INFO("SESSION", "Session disconnected — state reset to IDLE");
+}
+
+void net_session_refresh_discovery_announcement(void)
+{
+    net_discovery_announcement announcement;
+
+    if (session.role != NET_ROLE_HOST || session.state == NET_SESSION_IDLE) {
+        return;
+    }
+
+    build_discovery_announcement(&announcement);
+    net_discovery_update_announcing(&announcement);
 }
 
 void net_session_update(void)
@@ -1595,6 +2149,7 @@ int net_session_transition_to_game(void)
     log_info("Session transitioned to game", 0, 0);
     MP_LOG_INFO("SESSION", "Session transitioned to game: tick=%u speed=%d peers=%d",
                 session.authoritative_tick, (int)session.game_speed, session.peer_count);
+    net_session_refresh_discovery_announcement();
     return 1;
 }
 

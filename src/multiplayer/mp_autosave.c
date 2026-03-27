@@ -4,11 +4,9 @@
 
 #include "mp_safe_file.h"
 #include "mp_debug_log.h"
-#include "session_save.h"
 #include "time_sync.h"
 #include "network/session.h"
 #include "core/log.h"
-#include "core/dir.h"
 #include "game/file.h"
 #include "scenario/empire.h"
 #include "platform/file_manager.h"
@@ -16,8 +14,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-
-#define MP_SESSION_SAVE_BUFFER_SIZE 262144  /* 256KB */
 
 static struct {
     int initialized;
@@ -66,28 +62,6 @@ void mp_autosave_mark_dirty(uint32_t reason)
 int mp_autosave_is_dirty(void)
 {
     return autosave.dirty_flags != 0;
-}
-
-static int perform_save_to_buffer(uint8_t *buffer, uint32_t buffer_size, uint32_t *out_size)
-{
-    if (!net_session_is_host()) {
-        log_error("mp_autosave: only host can save", 0, 0);
-        return 0;
-    }
-
-    /* Use the game's normal save path which includes both base game and MP data */
-    const char *save_path = mp_safe_file_get_save_path(MP_SAVE_CURRENT_FILENAME);
-    if (!save_path) {
-        log_error("mp_autosave: cannot resolve save path", 0, 0);
-        return 0;
-    }
-
-    /* Perform a full game save using the engine's save system */
-    int result = game_file_write_saved_game(save_path);
-    if (result) {
-        *out_size = 1; /* Signal success; actual size managed by game_file */
-    }
-    return result;
 }
 
 static int do_full_save(const char *target, const char *backup)

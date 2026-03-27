@@ -31,11 +31,14 @@
  *   - Header checksum
  *   - Forward-compatible domain tags (unknown domains skipped by size)
  *   - Structured error codes
+ *
+ * v6 additions:
+ *   - Dedicated P2P routes domain (mp_trade_route_instance table)
  */
 
 #define MP_SAVE_MAGIC       0x4D504C59  /* "MPLY" */
-#define MP_SAVE_VERSION     5
-#define MP_SAVE_DOMAIN_COUNT 7
+#define MP_SAVE_VERSION     6
+#define MP_SAVE_DOMAIN_COUNT 8
 
 #define MP_SAVE_MAX_FILE_SIZE       (512 * 1024)
 #define MP_SAVE_MAX_DOMAIN_SIZE     (128 * 1024)
@@ -52,7 +55,8 @@
 #define MP_DOMAIN_TAG_EMPIRE_SYNC        0x04
 #define MP_DOMAIN_TAG_TRADE_SYNC_ROUTES  0x05
 #define MP_DOMAIN_TAG_TRADE_SYNC_TRADERS 0x06
-#define MP_DOMAIN_TAG_TIME_SYNC          0x07
+#define MP_DOMAIN_TAG_P2P_ROUTES         0x07
+#define MP_DOMAIN_TAG_TIME_SYNC          0x08
 
 /* Load error codes */
 #define MP_LOAD_OK                  0
@@ -86,6 +90,7 @@ typedef struct {
     uint32_t empire_sync_size;
     uint32_t trade_sync_routes_size;
     uint32_t trade_sync_traders_size;
+    uint32_t p2p_routes_size;
     uint32_t time_sync_size;
     uint32_t next_command_sequence_id;
     /* v4 fields */

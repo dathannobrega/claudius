@@ -19,6 +19,8 @@
 #include "empire/trade_route.h"
 #ifdef ENABLE_MULTIPLAYER
 #include "multiplayer/empire_sync.h"
+#include "multiplayer/ownership.h"
+#include "network/session.h"
 #endif
 #include "game/campaign.h"
 #include "game/save_version.h"
@@ -328,6 +330,8 @@ void empire_select_object_by_id(int object_id)
 
 int empire_can_export_resource_to_city(int city_id, int resource)
 {
+    int route_id = empire_city_get_primary_legacy_route_id(city_id);
+
     if (!resource_is_storable(resource)) {
         return 0;
     }
@@ -338,7 +342,12 @@ int empire_can_export_resource_to_city(int city_id, int resource)
     }
 #endif
     empire_city *city = empire_city_get(city_id);
-    if (city_id && trade_route_limit_reached(city->route_id, resource, 1)) {
+    if (!city) {
+        return city_id == 0
+            ? (city_resource_trade_status((resource_type)resource) & TRADE_STATUS_EXPORT) == TRADE_STATUS_EXPORT
+            : 0;
+    }
+    if (city_id && route_id > 0 && trade_route_limit_reached(route_id, resource, 1)) {
         // quota reached
         return 0;
     }
@@ -376,6 +385,8 @@ int empire_can_export_resource_to_city(int city_id, int resource)
 
 int empire_can_import_resource_from_city(int city_id, int resource)
 {
+    int route_id = empire_city_get_primary_legacy_route_id(city_id);
+
     if (!resource_is_storable(resource)) {
         return 0;
     }
@@ -386,13 +397,16 @@ int empire_can_import_resource_from_city(int city_id, int resource)
     }
 #endif
     empire_city *city = empire_city_get(city_id);
+    if (!city) {
+        return 0;
+    }
     if (!city->sells_resource[resource]) {
         return 0;
     }
     if (!(city_resource_trade_status(resource) & TRADE_STATUS_IMPORT)) {
         return 0;
     }
-    if (trade_route_limit_reached(city->route_id, resource, 0)) {
+    if (route_id > 0 && trade_route_limit_reached(route_id, resource, 0)) {
         return 0;
     }
 
@@ -554,6 +568,9 @@ void empire_apply_remote_city_trade_view(int city_id, const int *exportable,
 
 int empire_can_export_resource_to_remote_city(int city_id, int resource)
 {
+    trade_route_view route_view;
+    int local_city_id = net_session_is_active() ? mp_ownership_find_local_city() : -1;
+
     /* For remote cities, defer to the replicated trade view */
     const mp_city_trade_view *view = mp_empire_sync_get_trade_view(city_id);
     if (!view || !view->online) {
@@ -564,6 +581,15 @@ int empire_can_export_resource_to_remote_city(int city_id, int resource)
     }
     /* Can we export if the remote city can import this resource? */
     if (!view->importable[resource]) {
+        return 0;
+    }
+    if (!trade_route_get_view_for_city_pair(local_city_id, city_id, &route_view) ||
+        route_view.route_id < 0 || !route_view.is_open ||
+        !route_view.route_export_enabled[resource]) {
+        return 0;
+    }
+    if (route_view.route_export_limit[resource] > 0 &&
+        route_view.route_exported_this_year[resource] >= route_view.route_export_limit[resource]) {
         return 0;
     }
     /* Check our local stock */
@@ -583,6 +609,9 @@ int empire_can_export_resource_to_remote_city(int city_id, int resource)
 
 int empire_can_import_resource_from_remote_city(int city_id, int resource)
 {
+    trade_route_view route_view;
+    int local_city_id = net_session_is_active() ? mp_ownership_find_local_city() : -1;
+
     const mp_city_trade_view *view = mp_empire_sync_get_trade_view(city_id);
     if (!view || !view->online) {
         return 0;
@@ -592,6 +621,15 @@ int empire_can_import_resource_from_remote_city(int city_id, int resource)
     }
     /* Can we import if the remote city can export this resource? */
     if (!view->exportable[resource]) {
+        return 0;
+    }
+    if (!trade_route_get_view_for_city_pair(local_city_id, city_id, &route_view) ||
+        route_view.route_id < 0 || !route_view.is_open ||
+        !route_view.route_import_enabled[resource]) {
+        return 0;
+    }
+    if (route_view.route_import_limit[resource] > 0 &&
+        route_view.route_imported_this_year[resource] >= route_view.route_import_limit[resource]) {
         return 0;
     }
     /* P2P route configuration is the import authorization — no need to check

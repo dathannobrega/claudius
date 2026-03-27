@@ -46,11 +46,11 @@
 #ifdef ENABLE_MULTIPLAYER
 #include "multiplayer/command_bus.h"
 #include "multiplayer/empire_sync.h"
+#include "multiplayer/mp_trade_route.h"
 #include "multiplayer/ownership.h"
 #include "multiplayer/player_registry.h"
 #include "network/session.h"
 #include "translation/translation.h"
-#include "window/multiplayer_p2p_trade.h"
 #endif
 
 #include <math.h>
@@ -75,6 +75,8 @@
 #define MAX_RESOURCE_BUTTONS 256
 #define MAX_TRADE_OPEN_BUTTONS 64
 #define MAX_TRADE_EDGES 4096
+#define MAX_TRADE_ROUTE_LISTS 256
+#define MAX_ROUTE_EDGES_PER_LIST 256
 #define MAX_DOTS_PER_ROUTE 1024
 #define MAX_DOTS_ON_MAP (MAX_DOTS_PER_ROUTE * MAX_SIDEBAR_CITIES)
 #define TRADE_PULSE_DOT_MS 180 
@@ -105,6 +107,11 @@ typedef enum {
     TRADE_STYLE_MAIN_BAR,
     TRADE_STYLE_SIDEBAR
 } trade_style_variant;
+
+typedef enum {
+    TRADE_OPEN_ACTION_LEGACY = 0,
+    TRADE_OPEN_ACTION_CREATE_P2P = 1
+} trade_open_action;
 
 typedef struct {
     int x;
@@ -162,12 +169,15 @@ typedef struct {
 typedef struct {
     int x, y, width, height;
     int route_id;
+    int city_id;
+    int action_type;
     int do_highlight;
 } trade_open_button;
 
 typedef struct {
     int x, y, width, height;
     resource_type res;
+    int route_id;
     int do_highlight;
 } resource_button;
 // Edges are DIRECTIONAL (start->end). No normalization.
@@ -182,6 +192,13 @@ typedef struct {
 } trade_edge;
 
 typedef struct {
+    int route_id;
+    int is_sea;
+    int edge_count;
+    int edge_indices[MAX_ROUTE_EDGES_PER_LIST];
+} trade_route_edge_list;
+
+typedef struct {
     int x;
     int y;
     int is_sea;
@@ -194,19 +211,23 @@ struct trade_route_anim {
 
 static trade_edge g_trade_edges[MAX_TRADE_EDGES];
 static int g_trade_edge_count = 0;
-
-// For each route_id: a list of 0-based edge indices, terminated by -1.
-static int trade_city_edges[MAX_SIDEBAR_CITIES][MAX_TRADE_EDGES];
 // measurements and scales helper functions
-static int measure_trade_row_width(const empire_city *city, int is_sell, const trade_row_style *style); // ???
+static int measure_trade_row_width(const trade_route_view *route_view, int is_sell, const trade_row_style *style);
 static void image_draw_silh_scaled_centered(int image_id, int x, int y, color_t color, int draw_scale_percent);
 static void animation_draw_scaled(const image *img, int image_id, int new_animation, int x, int y, color_t color, int draw_scale_percent);
 static int open_trade_button_icon_fits(const empire_city *city, const open_trade_button_style *style, trade_icon_type icon_type);
+static int local_trade_city_id(void);
+static int selected_trade_view(trade_route_view *out);
+#ifdef ENABLE_MULTIPLAYER
+static translation_key route_state_translation_key(int route_state);
+static font_t route_state_font(int route_state);
+#endif
 static void draw_sidebar_city_item(const grid_box_item *item);
 static int draw_images_at_interval(int image_id, int x_draw_offset, int y_draw_offset,
     int start_x, int start_y, int end_x, int end_y, int interval, int remaining);
 void window_empire_collect_trade_edges(void);
-static void window_empire_draw_trade_route_pulses(const empire_object *route_object, int x_offset, int y_offset);
+static void window_empire_draw_trade_route_pulses_by_id(int route_id, int is_sea_route, int x_offset, int y_offset);
+static void window_empire_draw_static_trade_route_by_id(int route_id, int is_sea_route, int x_offset, int y_offset, int animate_pulses);
 // 'styles' get functions
 static trade_row_style get_trade_row_style(const empire_city *city, int is_sell, int max_draw_width, trade_style_variant variant);
 static open_trade_button_style get_open_trade_button_style(int x, int y, trade_style_variant variant);
@@ -217,7 +238,7 @@ static void button_return_to_city(int param1, int param2);
 static void button_advisor(int advisor, int param2);
 static void button_show_prices(int param1, int param2);
 static void button_show_resource_window(int resource_button_index);
-static void button_open_trade_by_route(int route_id);
+static void button_open_trade_by_route(int route_id, int city_id, int action_type);
 
 //sidebar show/hide
 static void sidebar_collapse(void);
@@ -234,14 +255,16 @@ static void handle_sidebar_border(const mouse *m);
 static void on_sidebar_city_click(const grid_box_item *item);
 
 //buttons position registrators to enable dynamic positioning
-static void register_resource_button(int x, int y, int width, int height, resource_type r, int highlight);
-static void register_open_trade_button(int x, int y, int width, int height, int route_id, int highlight);
+static void register_resource_button(int x, int y, int width, int height, resource_type r, int route_id, int highlight);
+static void register_open_trade_button(int x, int y, int width, int height, int route_id, int city_id, int action_type, int highlight);
 
 //arrays and counts for sidebar trade, resource and sorting buttons
 static trade_open_button trade_open_buttons[MAX_TRADE_OPEN_BUTTONS];
 static int trade_open_button_count = 0;
 static resource_button resource_buttons[MAX_RESOURCE_BUTTONS];
 static int resource_button_count = 0;
+static trade_route_edge_list g_trade_route_lists[MAX_TRADE_ROUTE_LISTS];
+static int g_trade_route_list_count = 0;
 
 //sidebar-related arrays and variables
 static scrollbar_type sidebar_scrollbar;
@@ -280,6 +303,8 @@ static struct {
     unsigned int selected_button;
     int selected_city;
     int selected_trade_route;
+    int selected_trade_city;
+    int selected_trade_action;
     int x_min, x_max, y_min, y_max;
     int x_draw_offset, y_draw_offset;
     int usable_map_width;
@@ -323,6 +348,9 @@ static struct {
 static void init(void)
 {
     data.selected_button = NO_POSITION; // no button selected
+    data.selected_trade_route = -1;
+    data.selected_trade_city = -1;
+    data.selected_trade_action = TRADE_OPEN_ACTION_LEGACY;
     data.trade_route_anim_start = 0;
     window_empire_sidebar_sort_set_expanded_main(NO_POSITION);
     if (!data.sidebar.initialised) {
@@ -558,21 +586,46 @@ static int open_trade_button_icon_fits(const empire_city *city, const open_trade
     return width_full < available_width;
 }
 
-static int measure_trade_row_width(const empire_city *city, int is_sell, const trade_row_style *style)
+static int route_view_has_resources(const trade_route_view *route_view, int is_sell)
+{
+    if (!route_view || !route_view->valid) {
+        return 0;
+    }
+
+    for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
+        if (!resource_is_storable(r)) {
+            continue;
+        }
+        if ((is_sell && route_view->counterpart_sells[r]) ||
+            (!is_sell && route_view->counterpart_buys[r])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int measure_trade_row_width(const trade_route_view *route_view, int is_sell, const trade_row_style *style)
 {
     const int ICON_WIDTH = 26;
     int width = 0;
 
+    if (!route_view || !route_view->valid) {
+        return 0;
+    }
+
     for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
         if (!resource_is_storable(r)) continue;
-        if ((is_sell && !city->sells_resource[r]) || (!is_sell && !city->buys_resource[r])) continue;
+        if ((is_sell && !route_view->counterpart_sells[r]) ||
+            (!is_sell && !route_view->counterpart_buys[r])) continue;
 
-        int w_max = text_get_number_width(trade_route_limit(city->route_id, r, !is_sell), '\0', "", FONT_NORMAL_GREEN);
+        int trade_limit = is_sell ? route_view->display_sell_limit[r] : route_view->display_buy_limit[r];
+        int trade_traded = is_sell ? route_view->display_sell_traded[r] : route_view->display_buy_traded[r];
+        int w_max = text_get_number_width(trade_limit, '\0', "", FONT_NORMAL_GREEN);
         int segment_width;
 
-        if (city->is_open) {
+        if (route_view->is_open) {
             // Also need width of current amount and "of" label
-            int w_now = text_get_number_width(trade_route_traded(city->route_id, r, !is_sell), '\0', "", FONT_NORMAL_GREEN);
+            int w_now = text_get_number_width(trade_traded, '\0', "", FONT_NORMAL_GREEN);
             int w_of = lang_text_get_width(47, 11, FONT_NORMAL_GREEN);
 
             segment_width =
@@ -593,7 +646,7 @@ static int measure_trade_row_width(const empire_city *city, int is_sell, const t
         width += segment_width;
     }
 
-    if (window_empire_sidebar_sort_count_trade_resources(city, is_sell)) {
+    if (route_view_has_resources(route_view, is_sell)) {
         width += style->label_indent;
     }
 
@@ -736,13 +789,111 @@ static int add_or_get_trade_edge(int start_x, int start_y, int end_x, int end_y,
     return new_edge.id;
 }
 
+static void clear_trade_route_edge_lists(void)
+{
+    g_trade_route_list_count = 0;
+    memset(g_trade_route_lists, 0, sizeof(g_trade_route_lists));
+    for (int i = 0; i < MAX_TRADE_ROUTE_LISTS; i++) {
+        g_trade_route_lists[i].route_id = -1;
+        for (int j = 0; j < MAX_ROUTE_EDGES_PER_LIST; j++) {
+            g_trade_route_lists[i].edge_indices[j] = -1;
+        }
+    }
+}
+
+static trade_route_edge_list *find_trade_route_edge_list_mutable(int route_id)
+{
+    for (int i = 0; i < g_trade_route_list_count; i++) {
+        if (g_trade_route_lists[i].route_id == route_id) {
+            return &g_trade_route_lists[i];
+        }
+    }
+    return 0;
+}
+
+static const trade_route_edge_list *find_trade_route_edge_list(int route_id)
+{
+    return find_trade_route_edge_list_mutable(route_id);
+}
+
+static trade_route_edge_list *ensure_trade_route_edge_list(int route_id, int is_sea)
+{
+    trade_route_edge_list *route_list = find_trade_route_edge_list_mutable(route_id);
+    if (route_list) {
+        route_list->is_sea = is_sea;
+        return route_list;
+    }
+
+    if (g_trade_route_list_count >= MAX_TRADE_ROUTE_LISTS) {
+        return 0;
+    }
+
+    route_list = &g_trade_route_lists[g_trade_route_list_count++];
+    route_list->route_id = route_id;
+    route_list->is_sea = is_sea;
+    route_list->edge_count = 0;
+    for (int i = 0; i < MAX_ROUTE_EDGES_PER_LIST; i++) {
+        route_list->edge_indices[i] = -1;
+    }
+    return route_list;
+}
+
+static void trade_route_edge_list_add_edge(trade_route_edge_list *route_list, int edge_index)
+{
+    if (!route_list || edge_index < 0 || route_list->edge_count >= MAX_ROUTE_EDGES_PER_LIST) {
+        return;
+    }
+
+    route_list->edge_indices[route_list->edge_count++] = edge_index;
+    if (route_list->edge_count < MAX_ROUTE_EDGES_PER_LIST) {
+        route_list->edge_indices[route_list->edge_count] = -1;
+    }
+}
+
+#ifdef ENABLE_MULTIPLAYER
+static int collect_multiplayer_trade_route_edge(mp_trade_route_instance *route, void *userdata)
+{
+    (void)userdata;
+
+    if (!route || !route->is_player_to_player ||
+        route->status == MP_TROUTE_DELETED || route->claudius_route_id <= 0) {
+        return 0;
+    }
+
+    const empire_city *origin_city = empire_city_get(route->origin_city_id);
+    const empire_city *dest_city = empire_city_get(route->dest_city_id);
+    if (!origin_city || !dest_city || !origin_city->in_use || !dest_city->in_use) {
+        return 0;
+    }
+
+    const empire_object *origin_object = empire_object_get(origin_city->empire_object_id);
+    const empire_object *dest_object = empire_object_get(dest_city->empire_object_id);
+    if (!origin_object || !dest_object) {
+        return 0;
+    }
+
+    trade_route_edge_list *route_list = ensure_trade_route_edge_list(
+        route->claudius_route_id, route->transport == MP_TROUTE_SEA);
+    if (!route_list) {
+        return 0;
+    }
+
+    int edge_index = add_or_get_trade_edge(
+        origin_object->x + 25, origin_object->y + 25,
+        dest_object->x + 25, dest_object->y + 25,
+        route->claudius_route_id, route->transport == MP_TROUTE_SEA);
+    trade_route_edge_list_add_edge(route_list, edge_index);
+    return 0;
+}
+#endif
+
 void window_empire_collect_trade_edges(void)
 {
     const empire_object *our_city_object = empire_object_get_our_city();
     g_trade_edge_count = 0;
     memset(g_trade_edges, 0, sizeof(g_trade_edges));
-    memset(trade_city_edges, 0xFF, sizeof(trade_city_edges));
-    // Pre-fill per-route edge lists with -1 (sentinel terminator).
+    clear_trade_route_edge_lists();
+
     for (int object_index = 0; object_index < empire_object_count(); object_index++) {
         const empire_object *route_object = empire_object_get(object_index);
         if (!empire_object_get_full(object_index)->in_use) {
@@ -758,14 +909,13 @@ void window_empire_collect_trade_edges(void)
         }
 
         int route_id = route_object->trade_route_id;
-        if (route_id < 0 || route_id >= MAX_SIDEBAR_CITIES) {
-            continue; // invalid route id; skip this route
-        }
-
         const empire_object *trade_city_object = empire_object_get_trade_city(route_id);
+        trade_route_edge_list *route_list = ensure_trade_route_edge_list(route_id, is_sea_route);
+        if (!trade_city_object || !route_list || !our_city_object) {
+            continue;
+        }
         int segment_start_x = our_city_object->x + 25;
         int segment_start_y = our_city_object->y + 25;
-        int route_edge_count = 0;
 
         for (int waypoint_index = 0; waypoint_index < empire_object_count(); ) {
             int waypoint_object_id = empire_object_get_next_in_order(object_index, &waypoint_index);
@@ -780,12 +930,7 @@ void window_empire_collect_trade_edges(void)
             int edge_index = add_or_get_trade_edge(
                 segment_start_x, segment_start_y, waypoint_object->x, waypoint_object->y, route_id, is_sea_route);
 
-            if (edge_index >= 0) {
-                if (route_edge_count < MAX_TRADE_EDGES) {
-                    trade_city_edges[route_id][route_edge_count] = edge_index;
-                    route_edge_count++;
-                }
-            }
+            trade_route_edge_list_add_edge(route_list, edge_index);
 
             segment_start_x = waypoint_object->x;
             segment_start_y = waypoint_object->y;
@@ -798,45 +943,32 @@ void window_empire_collect_trade_edges(void)
         int final_edge_index = add_or_get_trade_edge(
             segment_start_x, segment_start_y, city_center_x, city_center_y, route_id, is_sea_route);
 
-        if (final_edge_index >= 0) {
-            if (route_edge_count < MAX_TRADE_EDGES) {
-                trade_city_edges[route_id][route_edge_count] = final_edge_index;
-                route_edge_count++;
-            }
-        }
-
-        if (route_edge_count < MAX_TRADE_EDGES) {
-            trade_city_edges[route_id][route_edge_count] = -1; // explicit terminator for clarity
-        }
+        trade_route_edge_list_add_edge(route_list, final_edge_index);
     }
+
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        mp_trade_route_foreach(collect_multiplayer_trade_route_edge, 0);
+    }
+#endif
 }
 
-void window_empire_draw_static_trade_waypoints(const empire_object *route_object, int x_offset, int y_offset)
+static void window_empire_draw_static_trade_route_by_id(int route_id, int is_sea_route,
+                                                        int x_offset, int y_offset,
+                                                        int animate_pulses)
 {
-    if (scenario_empire_id() != SCENARIO_CUSTOM_EMPIRE) {
+    const trade_route_edge_list *route_list = find_trade_route_edge_list(route_id);
+    if (!route_list) {
         return;
     }
-    int is_sea_route = route_object->type == EMPIRE_OBJECT_SEA_TRADE_ROUTE;
 
     int image_id = assets_get_image_id("UI", is_sea_route ? "SeaRouteDot" : "LandRouteDot");
-    int route_id = route_object->trade_route_id;
-    if (route_id < 0 || route_id >= MAX_SIDEBAR_CITIES) {
-        return; // invalid route id; nothing to draw
-    }
 
     // Even spacing across the whole polychain; remainder carries between edges.
-    const empire_object *our_city_object = empire_object_get_our_city();
-    (void) our_city_object; // not needed here but kept for parity with collection step
-
     int remaining_spacing = TRADE_DOT_SPACING;
 
-    for (int list_index = 0; list_index < MAX_TRADE_EDGES; list_index++) {
-        int edge_index = trade_city_edges[route_id][list_index];
-
-        if (edge_index < 0) {
-            break; // reached sentinel; no more edges for this route
-        }
-
+    for (int list_index = 0; list_index < route_list->edge_count; list_index++) {
+        int edge_index = route_list->edge_indices[list_index];
         if (edge_index >= g_trade_edge_count) {
             continue; // stale or out-of-range mapping; skip this edge
         }
@@ -849,26 +981,32 @@ void window_empire_draw_static_trade_waypoints(const empire_object *route_object
 
         edge->drawn = 1; // mark as processed for this frame
     }
-    if (config_get(CONFIG_UI_ANIMATE_TRADE_ROUTES)) {
-        window_empire_draw_trade_route_pulses(route_object, x_offset, y_offset);
+    if (animate_pulses && config_get(CONFIG_UI_ANIMATE_TRADE_ROUTES)) {
+        window_empire_draw_trade_route_pulses_by_id(route_id, is_sea_route, x_offset, y_offset);
     }
+}
+
+void window_empire_draw_static_trade_waypoints(const empire_object *route_object, int x_offset, int y_offset)
+{
+    if (scenario_empire_id() != SCENARIO_CUSTOM_EMPIRE) {
+        return;
+    }
+    int is_sea_route = route_object->type == EMPIRE_OBJECT_SEA_TRADE_ROUTE;
+    window_empire_draw_static_trade_route_by_id(route_object->trade_route_id, is_sea_route, x_offset, y_offset, 1);
 }
 
 static void draw_trade_route_pulse_index(int image_id, int x_offset, int y_offset, int route_id, int dot_index)
 {
-    if (!image_id || !route_id) {
+    const trade_route_edge_list *route_list = find_trade_route_edge_list(route_id);
+    if (!image_id || route_id <= 0 || !route_list) {
         return;
     }
 
     int target_distance = dot_index * TRADE_DOT_SPACING;
     int accumulated_distance = 0;
 
-    for (int list_index = 0; list_index < MAX_TRADE_EDGES; list_index++) {
-        int edge_index = trade_city_edges[route_id][list_index];
-        if (edge_index < 0) {
-            break;
-        }
-
+    for (int list_index = 0; list_index < route_list->edge_count; list_index++) {
+        int edge_index = route_list->edge_indices[list_index];
         trade_edge *edge = &g_trade_edges[edge_index];
         int dx = edge->x2 - edge->x1;
         int dy = edge->y2 - edge->y1;
@@ -888,25 +1026,18 @@ static void draw_trade_route_pulse_index(int image_id, int x_offset, int y_offse
     }
 }
 
-static void window_empire_draw_trade_route_pulses(const empire_object *route_object, int x_offset, int y_offset)
+static void window_empire_draw_trade_route_pulses_by_id(int route_id, int is_sea_route,
+                                                        int x_offset, int y_offset)
 {
-    int is_sea_route = 0;
-    if (route_object->type == EMPIRE_OBJECT_SEA_TRADE_ROUTE) {
-        is_sea_route = 1;
-    } else if (route_object->type == EMPIRE_OBJECT_LAND_TRADE_ROUTE) {
-        is_sea_route = 0;
-    } else {
+    const trade_route_edge_list *route_list = find_trade_route_edge_list(route_id);
+    if (!route_list) {
         return;
     }
-    int route_id = route_object->trade_route_id;
     int pulse_image_id = assets_get_image_id("UI", !is_sea_route ? "SeaRouteDot" : "LandRouteDot"); //opposite image
 
     int total_length_pixels = 0;
-    for (int list_index = 0; list_index < MAX_TRADE_EDGES; list_index++) {
-        int edge_index = trade_city_edges[route_id][list_index];
-        if (edge_index < 0) {
-            break; // no more edges
-        }
+    for (int list_index = 0; list_index < route_list->edge_count; list_index++) {
+        int edge_index = route_list->edge_indices[list_index];
         trade_edge *edge = &g_trade_edges[edge_index];
         int delta_x = edge->x2 - edge->x1;
         int delta_y = edge->y2 - edge->y1;
@@ -972,7 +1103,8 @@ void window_empire_draw_resource_shields(int trade_max, int x_offset, int y_offs
     }
 }
 
-void draw_open_trade_button(const empire_city *city, const open_trade_button_style *style, trade_icon_type icon_type)
+void draw_open_trade_button(const empire_city *city, const trade_route_view *route_view,
+    int city_id, int action_type, const open_trade_button_style *style, trade_icon_type icon_type)
 {
     int cost = city->cost_to_open;
     int x = style->button_x_min;
@@ -1014,7 +1146,9 @@ void draw_open_trade_button(const empire_city *city, const open_trade_button_sty
 
     // --- Draw button border and register its position ---
     button_border_draw(x, y, style->button_width, style->button_height, 0);
-    register_open_trade_button(x, y, style->button_width, style->button_height, city->route_id, 0);
+    register_open_trade_button(x, y, style->button_width, style->button_height,
+        route_view ? route_view->route_id : empire_city_get_primary_legacy_route_id(city_id),
+        city_id, action_type, 0);
 
     // Center content horizontally, preset vertical position
     int cursor_x = x + (available_width - content_width) / 2 - 2; //-2 to account for the button border. Makes small resolutions look better
@@ -1039,10 +1173,11 @@ void draw_open_trade_button(const empire_city *city, const open_trade_button_sty
     }
 }
 
-static int draw_trade_row(const empire_city *city, int is_sell, int x, int y, const trade_row_style *style)
+static int draw_trade_row(const empire_city *city, const trade_route_view *route_view,
+                          int is_sell, int x, int y, const trade_row_style *style)
 {
     int label_id;
-    if (city->is_open) {
+    if (route_view && route_view->is_open) {
         label_id = is_sell ? 10 : 9;
     } else {
         label_id = is_sell ? 5 : 4;
@@ -1051,7 +1186,16 @@ static int draw_trade_row(const empire_city *city, int is_sell, int x, int y, co
     int x_cursor = x + style->x_offset_text;
     int y_cursor = y + style->y_offset_text;
     int dots_width = text_get_width((const uint8_t *) "(...)", FONT_NORMAL_GREEN) + 2;
-    int draw_label = window_empire_sidebar_sort_count_trade_resources(city, is_sell); //check if there are any resources to draw
+    int draw_label = route_view ? 0 : window_empire_sidebar_sort_count_trade_resources(city, is_sell);
+    if (route_view) {
+        for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
+            if ((is_sell && route_view->counterpart_sells[r]) ||
+                (!is_sell && route_view->counterpart_buys[r])) {
+                draw_label = 1;
+                break;
+            }
+        }
+    }
     if (!draw_label) {
         // No resources to draw, return current x position
         return x_cursor;
@@ -1068,7 +1212,7 @@ static int draw_trade_row(const empire_city *city, int is_sell, int x, int y, co
         return x_cursor;
     }
     int label_width = lang_text_draw(47, label_id, x_cursor, y_cursor, FONT_NORMAL_GREEN);
-    if (city->is_open) {
+    if (route_view && route_view->is_open) {
         x_cursor += style->label_indent; //advance by pre-defined label width for open cities where there's two rows
     } else {
         x_cursor += label_width;
@@ -1077,15 +1221,16 @@ static int draw_trade_row(const empire_city *city, int is_sell, int x, int y, co
 
     for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
         if (!resource_is_storable(r)) continue;
-        if ((is_sell && !city->sells_resource[r]) || (!is_sell && !city->buys_resource[r])) continue;
+        if ((is_sell && !route_view->counterpart_sells[r]) ||
+            (!is_sell && !route_view->counterpart_buys[r])) continue;
 
-        int trade_max = trade_route_limit(city->route_id, r, !is_sell);
-        int trade_now = trade_route_traded(city->route_id, r, !is_sell);
+        int trade_max = is_sell ? route_view->display_sell_limit[r] : route_view->display_buy_limit[r];
+        int trade_now = is_sell ? route_view->display_sell_traded[r] : route_view->display_buy_traded[r];
         int icon_y = y + style->y_offset_icon;
 
         int segment_width, text_x;
 
-        if (city->is_open) {
+        if (route_view->is_open) {
             // Calculate widths
             int w_now = text_get_number_width(trade_now, '\0', "", FONT_NORMAL_GREEN); // '\0' - 0 length suffix.
             int w_max = text_get_number_width(trade_max, '\0', "", FONT_NORMAL_GREEN);
@@ -1119,7 +1264,7 @@ static int draw_trade_row(const empire_city *city, int is_sell, int x, int y, co
         // Draw numeric info
         text_x = x_cursor + style->seg_space_0 + RESOURCE_ICON_WIDTH + style->seg_space_1;
 
-        if (city->is_open) {
+        if (route_view->is_open) {
             int w_now = text_draw_number(trade_now, '\0', "", text_x, y_cursor, FONT_NORMAL_GREEN, 0);
             int of_x = text_x + w_now + style->seg_space_2;
             int w_of = lang_text_draw(47, 11, of_x, y_cursor, FONT_NORMAL_GREEN);
@@ -1135,7 +1280,8 @@ static int draw_trade_row(const empire_city *city, int is_sell, int x, int y, co
             segment_width,
             RESOURCE_ICON_HEIGHT,
             r,
-            city->is_open
+            route_view->route_id,
+            route_view->is_open
         );
 
         // Advance
@@ -1146,6 +1292,10 @@ static int draw_trade_row(const empire_city *city, int is_sell, int x, int y, co
 
 static void draw_trade_city_info(const empire_object *object, const empire_city *city)
 {
+    trade_route_view route_view;
+    if (!selected_trade_view(&route_view)) {
+        return;
+    }
     int y_offset = data.y_max - 113;
     const int safe_margin_left = data.panel.x_min + 50;
     const int safe_margin_right = data.panel.x_max - 50;
@@ -1154,41 +1304,42 @@ static void draw_trade_city_info(const empire_object *object, const empire_city 
     trade_row_style style_sells = get_trade_row_style(city, 1, max_draw_width, TRADE_STYLE_MAIN_BAR);
     trade_row_style style_buys = get_trade_row_style(city, 0, max_draw_width, TRADE_STYLE_MAIN_BAR);
     // === OPEN CITY ===
-    if (city->is_open) {
-        int width_sells = measure_trade_row_width(city, 1, &style_sells);
-        int width_buys = measure_trade_row_width(city, 0, &style_buys);
+    if (route_view.is_open) {
+        int width_sells = measure_trade_row_width(&route_view, 1, &style_sells);
+        int width_buys = measure_trade_row_width(&route_view, 0, &style_buys);
         int total_width = (width_sells > width_buys) ? width_sells : width_buys;
 
         if (total_width > max_draw_width)
             total_width = max_draw_width;
 
         int x_offset = safe_margin_left + (max_draw_width - total_width) / 2;
-        draw_trade_row(city, 1, x_offset, y_offset, &style_sells);
-        draw_trade_row(city, 0, x_offset, y_offset, &style_buys);
+        draw_trade_row(city, &route_view, 1, x_offset, y_offset, &style_sells);
+        draw_trade_row(city, &route_view, 0, x_offset, y_offset, &style_buys);
 
 
         // === CLOSED CITY ===
     } else {
-        int width_sells = measure_trade_row_width(city, 1, &style_sells);
-        int width_buys = measure_trade_row_width(city, 0, &style_buys);
+        int width_sells = measure_trade_row_width(&route_view, 1, &style_sells);
+        int width_buys = measure_trade_row_width(&route_view, 0, &style_buys);
         int total_width = width_sells + width_buys + 15;
 
         if (total_width > max_draw_width)
             total_width = max_draw_width;
 
         int x_base = safe_margin_left + (max_draw_width - total_width) / 2;
-        draw_trade_row(city, 1, x_base, y_offset, &style_sells);
-        draw_trade_row(city, 0, width_sells + x_base, y_offset, &style_buys);
+        draw_trade_row(city, &route_view, 1, x_base, y_offset, &style_sells);
+        draw_trade_row(city, &route_view, 0, width_sells + x_base, y_offset, &style_buys);
 
-        // Draw cost + type icon (skip for P2P player cities — they trade directly)
+        open_trade_button_style style = get_open_trade_button_style(x_base, y_offset + 73, TRADE_STYLE_MAIN_BAR);
+        int action_type = TRADE_OPEN_ACTION_LEGACY;
 #ifdef ENABLE_MULTIPLAYER
-        if (!(net_session_is_active() && data.selected_city >= 0 &&
-              mp_ownership_is_city_remote_player(data.selected_city)))
-#endif
-        {
-            open_trade_button_style style = get_open_trade_button_style(x_base, y_offset + 73, TRADE_STYLE_MAIN_BAR);
-            draw_open_trade_button(city, &style, (trade_icon_type) (city->is_sea_trade));
+        if (net_session_is_active() && data.selected_city >= 0 &&
+            mp_ownership_is_city_remote_player(data.selected_city)) {
+            action_type = TRADE_OPEN_ACTION_CREATE_P2P;
         }
+#endif
+        draw_open_trade_button(city, &route_view, data.selected_city, action_type,
+                               &style, (trade_icon_type)(city->is_sea_trade));
 
     }
 
@@ -1198,6 +1349,18 @@ static void draw_sidebar_city_item(const grid_box_item *item)
 {
     sidebar_city_entry *entry = &sidebar_cities[item->index];
     empire_city *city = empire_city_get(entry->city_id);
+    trade_route_view route_view;
+    if (!trade_route_get_view_for_city_pair(local_trade_city_id(), entry->city_id, &route_view)) {
+        memset(&route_view, 0, sizeof(route_view));
+        route_view.valid = 1;
+        route_view.route_id = empire_city_get_primary_legacy_route_id(entry->city_id);
+        route_view.counterpart_city_id = entry->city_id;
+        route_view.is_open = city->is_open;
+        for (resource_type r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
+            route_view.counterpart_sells[r] = city->sells_resource[r];
+            route_view.counterpart_buys[r] = city->buys_resource[r];
+        }
+    }
     const uint8_t *name = empire_city_get_name(city);
     //const grid_box_type *sidebar_grid_box;
 
@@ -1288,8 +1451,8 @@ static void draw_sidebar_city_item(const grid_box_item *item)
         }
 
         /* Route state */
-        if (city->route_id >= 0) {
-            mp_route_state rstate = mp_ownership_get_route_state(city->route_id);
+        if (route_view.route_id >= 0) {
+            mp_route_state rstate = (mp_route_state)route_view.state;
             translation_key rkey;
             font_t rfont;
             switch (rstate) {
@@ -1306,27 +1469,26 @@ static void draw_sidebar_city_item(const grid_box_item *item)
 #endif
     // Move y_offset down for trade info rows
     y_offset += 44;
-    if (city->is_open) {
+    if (route_view.is_open) {
         y_offset += 8; // For Sells
-        draw_trade_row(city, 1, x_offset, y_offset, &style_sells);
+        draw_trade_row(city, &route_view, 1, x_offset, y_offset, &style_sells);
         y_offset += 26; // For Buys
-        draw_trade_row(city, 0, x_offset, y_offset, &style_buys);
+        draw_trade_row(city, &route_view, 0, x_offset, y_offset, &style_buys);
     } else {// --- Closed city ---
-        int x_cursor = draw_trade_row(city, 1, x_offset, y_offset, &style_sells); //draw sell row
+        int x_cursor = draw_trade_row(city, &route_view, 1, x_offset, y_offset, &style_sells); //draw sell row
         int sell_row_width = x_cursor - x_offset;
         style_buys.row_width -= sell_row_width; //limit the available row width by the sell row length
-        draw_trade_row(city, 0, x_cursor, y_offset, &style_buys);
+        draw_trade_row(city, &route_view, 0, x_cursor, y_offset, &style_buys);
         y_offset += 35;
-        // Skip "Open trade route" button for P2P player cities (they trade directly)
+        open_trade_button_style open_trade_style_closed = get_open_trade_button_style(item->x, y_offset, TRADE_STYLE_SIDEBAR);
+        int action_type = TRADE_OPEN_ACTION_LEGACY;
 #ifdef ENABLE_MULTIPLAYER
-        if (!(net_session_is_active() &&
-              mp_ownership_is_city_remote_player(entry->city_id)))
-#endif
-        {
-            //recalculate the style basing on the new y_offset
-            open_trade_button_style open_trade_style_closed = get_open_trade_button_style(item->x, y_offset, TRADE_STYLE_SIDEBAR);
-            draw_open_trade_button(city, &open_trade_style_closed, (trade_icon_type) (city->is_sea_trade));
+        if (net_session_is_active() && mp_ownership_is_city_remote_player(entry->city_id)) {
+            action_type = TRADE_OPEN_ACTION_CREATE_P2P;
         }
+#endif
+        draw_open_trade_button(city, &route_view, entry->city_id, action_type,
+                               &open_trade_style_closed, (trade_icon_type)(city->is_sea_trade));
     }
     graphics_reset_clip_rectangle();
 }
@@ -1384,6 +1546,8 @@ static void draw_city_info(const empire_object *object)
         empire_city_is_player_owned(data.selected_city)) {
         int mp_y = data.y_max - 198;
         int mp_x = (data.panel.x_min + data.panel.x_max) / 2;
+        trade_route_view route_view;
+        int has_route_view = selected_trade_view(&route_view);
 
         uint8_t owner_pid = mp_ownership_get_city_player_id(data.selected_city);
         mp_player *owner = mp_player_registry_get(owner_pid);
@@ -1408,53 +1572,20 @@ static void draw_city_info(const empire_object *object)
         text_draw(status_text, mp_x + 40, mp_y, status_font, 0);
 
         /* Route state indicator for trade cities */
-        if (city->type == EMPIRE_CITY_TRADE && city->route_id >= 0) {
-            mp_route_state rstate = mp_ownership_get_route_state(city->route_id);
-            translation_key route_key;
-            font_t route_font;
-            switch (rstate) {
-                case MP_ROUTE_STATE_PENDING:
-                    route_key = TR_MP_EMPIRE_ROUTE_PENDING;
-                    route_font = FONT_NORMAL_BROWN;
-                    break;
-                case MP_ROUTE_STATE_ACTIVE:
-                    route_key = TR_MP_EMPIRE_ROUTE_ACTIVE;
-                    route_font = FONT_NORMAL_GREEN;
-                    break;
-                case MP_ROUTE_STATE_DISABLED:
-                    route_key = TR_MP_EMPIRE_ROUTE_DISABLED;
-                    route_font = FONT_NORMAL_RED;
-                    break;
-                case MP_ROUTE_STATE_OFFLINE:
-                    route_key = TR_MP_EMPIRE_ROUTE_OFFLINE;
-                    route_font = FONT_NORMAL_RED;
-                    break;
-                default:
-                    route_key = TR_MP_EMPIRE_ROUTE_ACTIVE;
-                    route_font = FONT_NORMAL_PLAIN;
-                    break;
-            }
-
+        if (city->type == EMPIRE_CITY_TRADE && has_route_view && route_view.route_id >= 0) {
             /* "Route: Active/Disabled/Offline/Pending" */
             const uint8_t *route_label = translation_for(TR_MP_TRADE_ADVISOR_ROUTE_STATE);
             int rlabel_w = text_draw(route_label, mp_x - 100, mp_y + 16, FONT_NORMAL_BLACK, 0);
-            text_draw(translation_for(route_key), mp_x - 100 + rlabel_w + 4, mp_y + 16, route_font, 0);
+            text_draw(translation_for(route_state_translation_key(route_view.state)),
+                mp_x - 100 + rlabel_w + 4, mp_y + 16, route_state_font(route_view.state), 0);
 
             /* P2P vs AI route indicator */
-            int is_p2p = mp_ownership_is_route_player_to_player(city->route_id);
-            translation_key type_key = is_p2p ? TR_MP_EMPIRE_ROUTE_P2P : TR_MP_EMPIRE_ROUTE_AI;
+            translation_key type_key = route_view.is_player_to_player
+                ? TR_MP_EMPIRE_ROUTE_P2P
+                : TR_MP_EMPIRE_ROUTE_AI;
             const uint8_t *type_text = translation_for(type_key);
-            font_t type_font = is_p2p ? FONT_NORMAL_BROWN : FONT_NORMAL_PLAIN;
+            font_t type_font = route_view.is_player_to_player ? FONT_NORMAL_BROWN : FONT_NORMAL_PLAIN;
             text_draw(type_text, mp_x + 40, mp_y + 16, type_font, 0);
-        }
-
-        /* "Trade" button for remote player cities */
-        if (mp_ownership_is_city_remote_player(data.selected_city)) {
-            int trade_btn_x = (data.panel.x_min + data.panel.x_max - 80) / 2;
-            int trade_btn_y = mp_y + 34;
-            button_border_draw(trade_btn_x, trade_btn_y, 80, 22, data.focus_button_id == 5);
-            text_draw_centered(translation_for(TR_MP_P2P_TRADE_BUTTON_TRADE),
-                trade_btn_x, trade_btn_y + 4, 80, FONT_NORMAL_BLACK, 0);
         }
     }
 #endif
@@ -1808,8 +1939,11 @@ static void draw_empire_object(const empire_object *obj)
 
             /* Draw route state indicator if trade city has a route */
             const empire_city *city = empire_city_get(city_id);
-            if (city && city->type == EMPIRE_CITY_TRADE && city->route_id >= 0) {
-                mp_route_state rstate = mp_ownership_get_route_state(city->route_id);
+            trade_route_view route_view;
+            if (city && city->type == EMPIRE_CITY_TRADE &&
+                trade_route_get_view_for_city_pair(local_trade_city_id(), city_id, &route_view) &&
+                route_view.route_id >= 0) {
+                mp_route_state rstate = (mp_route_state)route_view.state;
                 if (rstate == MP_ROUTE_STATE_DISABLED || rstate == MP_ROUTE_STATE_OFFLINE) {
                     /* Draw small X or slash over route indicator */
                     int rx = data.x_draw_offset + x - 4;
@@ -1836,6 +1970,27 @@ static void empire_draw_object_trade_route(const empire_object *obj)
     }
     return;
 }
+
+#ifdef ENABLE_MULTIPLAYER
+static int draw_multiplayer_trade_route(mp_trade_route_instance *route, void *userdata)
+{
+    (void)userdata;
+
+    if (!route || !route->is_player_to_player || route->status == MP_TROUTE_DELETED) {
+        return 0;
+    }
+
+    int route_state = mp_ownership_get_route_state(route->claudius_route_id);
+    int animate_pulses = (route_state == MP_ROUTE_STATE_ACTIVE);
+    window_empire_draw_static_trade_route_by_id(
+        route->claudius_route_id,
+        route->transport == MP_TROUTE_SEA,
+        data.x_draw_offset,
+        data.y_draw_offset,
+        animate_pulses);
+    return 0;
+}
+#endif
 
 static void animation_draw_scaled(const image *img, int image_id, int new_animation, int x, int y, color_t color, int draw_scale_percent)
 {
@@ -1900,6 +2055,11 @@ static void draw_map(void)
     empire_object_foreach(draw_empire_object);
     empire_object_foreach_of_type(empire_draw_object_trade_route, EMPIRE_OBJECT_SEA_TRADE_ROUTE);
     empire_object_foreach_of_type(empire_draw_object_trade_route, EMPIRE_OBJECT_LAND_TRADE_ROUTE);
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        mp_trade_route_foreach(draw_multiplayer_trade_route, 0);
+    }
+#endif
     empire_object_foreach_of_type(draw_empire_object, EMPIRE_OBJECT_LAND_TRADE_ROUTE);
     empire_object_foreach_of_type(draw_empire_object, EMPIRE_OBJECT_SEA_TRADE_ROUTE);
     empire_object_foreach_of_type(draw_empire_object, EMPIRE_OBJECT_CITY);
@@ -2058,8 +2218,10 @@ static void draw_foreground(void)
                 data.panel.x_min, data.y_max - 16, data.panel.x_max - data.panel.x_min,
                 FONT_NORMAL_BROWN, 0);
         } else if (last_status == MP_CMD_STATUS_REJECTED) {
-            uint8_t reject_buf[32];
-            string_copy(string_from_ascii("Command Rejected"), reject_buf, 32);
+            uint8_t reject_buf[96];
+            const char *reject_text = mp_command_bus_reject_reason_text(
+                mp_command_bus_get_last_reject_reason());
+            string_copy(string_from_ascii(reject_text), reject_buf, 96);
             text_draw_centered(reject_buf,
                 data.panel.x_min, data.y_max - 16, data.panel.x_max - data.panel.x_min,
                 FONT_NORMAL_RED, 0);
@@ -2100,6 +2262,57 @@ static void process_selection(void)
         data.selected_city = 0;
     }
 }
+
+static int local_trade_city_id(void)
+{
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        return mp_ownership_find_local_city();
+    }
+#endif
+    return -1;
+}
+
+static int selected_trade_view(trade_route_view *out)
+{
+    if (data.selected_city < 0) {
+        return 0;
+    }
+    return trade_route_get_view_for_city_pair(local_trade_city_id(), data.selected_city, out);
+}
+
+#ifdef ENABLE_MULTIPLAYER
+static translation_key route_state_translation_key(int route_state)
+{
+    switch (route_state) {
+        case MP_ROUTE_STATE_PENDING:
+            return TR_MP_EMPIRE_ROUTE_PENDING;
+        case MP_ROUTE_STATE_ACTIVE:
+            return TR_MP_EMPIRE_ROUTE_ACTIVE;
+        case MP_ROUTE_STATE_DISABLED:
+            return TR_MP_EMPIRE_ROUTE_DISABLED;
+        case MP_ROUTE_STATE_OFFLINE:
+            return TR_MP_EMPIRE_ROUTE_OFFLINE;
+        default:
+            return TR_MP_EMPIRE_ROUTE_ACTIVE;
+    }
+}
+
+static font_t route_state_font(int route_state)
+{
+    switch (route_state) {
+        case MP_ROUTE_STATE_PENDING:
+            return FONT_NORMAL_BROWN;
+        case MP_ROUTE_STATE_ACTIVE:
+            return FONT_NORMAL_GREEN;
+        case MP_ROUTE_STATE_DISABLED:
+        case MP_ROUTE_STATE_OFFLINE:
+            return FONT_NORMAL_RED;
+        default:
+            return FONT_NORMAL_PLAIN;
+    }
+}
+#endif
 
 // -------------------------------------------------------------------------------------------------------
 //                                              HANDLE INPUT
@@ -2186,12 +2399,7 @@ static void on_sidebar_city_click(const grid_box_item *item)
     window_invalidate();
 
 #ifdef ENABLE_MULTIPLAYER
-    /* Clicking a remote player city in the sidebar opens P2P trade directly */
-    if (net_session_is_active() &&
-        empire_city_is_player_owned(entry->city_id) &&
-        mp_ownership_is_city_remote_player(entry->city_id)) {
-        window_multiplayer_p2p_trade_show(entry->city_id);
-    }
+    (void)entry;
 #endif
 }
 
@@ -2306,28 +2514,6 @@ static void handle_input(const mouse *m, const hotkeys *h)
     }
 
 
-#ifdef ENABLE_MULTIPLAYER
-    /* Handle P2P trade button click BEFORE determine_selected_object(),
-     * because clicking the Trade button falls within the is_map() area
-     * and determine_selected_object would deselect the current city.
-     * data.selected_city is still valid from the draw phase. */
-    if (net_session_is_active() && data.selected_city >= 0 &&
-        empire_city_is_player_owned(data.selected_city) &&
-        mp_ownership_is_city_remote_player(data.selected_city)) {
-        int mp_y = data.y_max - 198;
-        int trade_btn_x = (data.panel.x_min + data.panel.x_max - 80) / 2;
-        int trade_btn_y = mp_y + 34;
-        if (m->x >= trade_btn_x && m->x < trade_btn_x + 80 &&
-            m->y >= trade_btn_y && m->y < trade_btn_y + 22) {
-            data.focus_button_id = 5;
-            if (m->left.went_up) {
-                window_multiplayer_p2p_trade_show(data.selected_city);
-                return;
-            }
-        }
-    }
-#endif
-
     button_id = 0;
     determine_selected_object(m);
     handle_sidebar_border(m);
@@ -2356,8 +2542,7 @@ static void handle_input(const mouse *m, const hotkeys *h)
             m->y >= btn->y && m->y < btn->y + btn->height) {
             data.selected_button = i;
             if (m->left.went_up) {
-
-                button_open_trade_by_route(btn->route_id);  // <-- Trigger popup
+                button_open_trade_by_route(btn->route_id, btn->city_id, btn->action_type);
                 data.selected_button = NO_POSITION; //reset to get rid of the highlight
             }
             break;  // Only process one button at a time
@@ -2495,22 +2680,44 @@ static void button_show_prices(int param1, int param2)
 static void button_show_resource_window(int resource_button_index)
 {
     resource_button *btn = &resource_buttons[resource_button_index];
-    window_resource_settings_show(btn->res);
+    if (btn->route_id > 0) {
+        window_resource_settings_show_for_route(btn->res, btn->route_id);
+    } else {
+        window_resource_settings_show(btn->res);
+    }
 }
 
 static void confirmed_open_trade_by_route(int accepted, int checked)
 {
+    (void) checked;
     if (accepted) {
-        int city_id = empire_city_get_for_trade_route(data.selected_trade_route);
+        int city_id = data.selected_trade_city;
 #ifdef ENABLE_MULTIPLAYER
         if (net_session_is_active()) {
             /* Route trade through the command bus for authoritative validation */
             mp_command cmd;
             memset(&cmd, 0, sizeof(cmd));
-            cmd.command_type = MP_CMD_OPEN_TRADE_ROUTE;
             cmd.player_id = net_session_get_local_player_id();
-            cmd.data.open_route.route_id = data.selected_trade_route;
-            cmd.data.open_route.city_id = city_id;
+
+            if (data.selected_trade_action == TRADE_OPEN_ACTION_CREATE_P2P) {
+                int local_city_id = local_trade_city_id();
+                if (city_id < 0 || local_city_id < 0) {
+                    city_warning_show(WARNING_NOT_AVAILABLE, NEW_WARNING_SLOT);
+                    return;
+                }
+                cmd.command_type = MP_CMD_CREATE_TRADE_ROUTE;
+                cmd.data.create_route.origin_city_id = local_city_id;
+                cmd.data.create_route.dest_city_id = city_id;
+                cmd.data.create_route.transport_mode = MP_CMD_ROUTE_TRANSPORT_AUTO;
+            } else {
+                if (city_id < 0) {
+                    city_id = empire_city_get_for_trade_route(data.selected_trade_route);
+                }
+                cmd.command_type = MP_CMD_OPEN_TRADE_ROUTE;
+                cmd.data.open_route.route_id = data.selected_trade_route;
+                cmd.data.open_route.city_id = city_id;
+            }
+
             mp_command_bus_submit(&cmd);
             /* Don't show trade_opened window immediately — wait for host ack */
             return;
@@ -2522,40 +2729,50 @@ static void confirmed_open_trade_by_route(int accepted, int checked)
     }
 }
 
-static void button_open_trade_by_route(int route_id)
+static void button_open_trade_by_route(int route_id, int city_id, int action_type)
 {
 #ifdef ENABLE_MULTIPLAYER
     if (net_session_is_active()) {
-        /* Check if the city for this route is offline */
-        int city_id = empire_city_get_for_trade_route(route_id);
         if (city_id >= 0 && empire_city_is_player_owned(city_id)) {
             if (!mp_ownership_is_city_online(city_id)) {
                 /* City is offline — don't allow trade opening */
                 city_warning_show(WARNING_NOT_AVAILABLE, NEW_WARNING_SLOT);
                 return;
             }
-            mp_route_state rstate = mp_ownership_get_route_state(route_id);
-            if (rstate == MP_ROUTE_STATE_DISABLED || rstate == MP_ROUTE_STATE_OFFLINE) {
-                city_warning_show(WARNING_NOT_AVAILABLE, NEW_WARNING_SLOT);
-                return;
+            if (action_type != TRADE_OPEN_ACTION_CREATE_P2P && route_id > 0) {
+                mp_route_state rstate = mp_ownership_get_route_state(route_id);
+                if (rstate == MP_ROUTE_STATE_DISABLED || rstate == MP_ROUTE_STATE_OFFLINE) {
+                    city_warning_show(WARNING_NOT_AVAILABLE, NEW_WARNING_SLOT);
+                    return;
+                }
+            }
+        }
+        if (action_type != TRADE_OPEN_ACTION_CREATE_P2P && route_id > 0) {
+            int resolved_city_id = empire_city_get_for_trade_route(route_id);
+            if (resolved_city_id >= 0) {
+                city_id = resolved_city_id;
             }
         }
     }
 #endif
     data.selected_trade_route = route_id;
+    data.selected_trade_city = city_id;
+    data.selected_trade_action = action_type;
     window_popup_dialog_show(POPUP_DIALOG_OPEN_TRADE, confirmed_open_trade_by_route, 2);
 }
 
-void register_resource_button(int x, int y, int width, int height, resource_type r, int highlight)
+void register_resource_button(int x, int y, int width, int height, resource_type r, int route_id, int highlight)
 {
     if (resource_button_count >= MAX_RESOURCE_BUTTONS) return;
-    resource_buttons[resource_button_count++] = (resource_button) { x, y, width, height, r, highlight };
+    resource_buttons[resource_button_count++] = (resource_button) { x, y, width, height, r, route_id, highlight };
 }
 
-void register_open_trade_button(int x, int y, int width, int height, int route_id, int highlight)
+void register_open_trade_button(int x, int y, int width, int height, int route_id, int city_id, int action_type, int highlight)
 {
     if (trade_open_button_count >= MAX_TRADE_OPEN_BUTTONS) return;
-    trade_open_buttons[trade_open_button_count++] = (trade_open_button) { x, y, width, height, route_id, highlight };
+    trade_open_buttons[trade_open_button_count++] = (trade_open_button) {
+        x, y, width, height, route_id, city_id, action_type, highlight
+    };
 }
 
 

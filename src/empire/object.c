@@ -24,6 +24,7 @@
 
 static array(full_empire_object) objects;
 empire_city_icon_type empire_object_get_random_icon_for_empire_object(full_empire_object *full_obj);
+static int object_no_condition(const empire_object *obj);
 static void fix_image_ids(void)
 {
     int image_id = 0;
@@ -1096,7 +1097,7 @@ static int is_name_rome(const uint8_t *name)
 {
     if (strcmp((const char *) name, "Rome") == 0 || strcmp((const char *) name, "Roma") == 0 ||
         strcmp((const char *) name, "Rom") == 0 || strcmp((const char *) name, "Rzym") == 0 ||
-        strcmp((const char *) name, "Рим") == 0) {
+        strcmp((const char *) name, "\xD0\xA0\xD0\xB8\xD0\xBC") == 0) {
         return 1;
     }
     return 0;

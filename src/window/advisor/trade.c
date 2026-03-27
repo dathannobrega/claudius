@@ -25,6 +25,7 @@
 #include "window/empire.h"
 #include "window/option_popup.h"
 #include "window/resource_settings.h"
+#include "window/select_list.h"
 #include "window/trade_prices.h"
 
 #ifdef ENABLE_MULTIPLAYER
@@ -41,6 +42,7 @@
 #define RESOURCE_Y_OFFSET 54
 #define RESOURCE_ROW_HEIGHT 41
 #define MAX_VISIBLE_ROWS 8
+#define MAX_ROUTE_SELECTIONS 16
 
 static void draw_resource_info(const grid_box_item *item);
 static void resource_item_tooltip(const grid_box_item *item, tooltip_context *c);
@@ -49,6 +51,7 @@ static void button_prices(const generic_button *button);
 static void button_empire(const generic_button *button);
 static void button_policy(const generic_button *button);
 static void button_resource(const grid_box_item *item);
+static void button_resource_route_selected(int index);
 
 static grid_box_type resource_grid = {
     .x = 16,
@@ -108,6 +111,23 @@ static struct {
     trade_policy_type policy_type;
 } data;
 
+#ifdef ENABLE_MULTIPLAYER
+static trade_route_view route_selection_views[MAX_ROUTE_SELECTIONS];
+static uint8_t route_selection_labels[MAX_ROUTE_SELECTIONS][80];
+static const uint8_t *route_selection_items[MAX_ROUTE_SELECTIONS];
+static int route_selection_count;
+static resource_type route_selection_resource;
+
+static void reset_route_selection(void)
+{
+    route_selection_count = 0;
+    route_selection_resource = RESOURCE_NONE;
+    memset(route_selection_views, 0, sizeof(route_selection_views));
+    memset(route_selection_labels, 0, sizeof(route_selection_labels));
+    memset(route_selection_items, 0, sizeof(route_selection_items));
+}
+#endif
+
 static void init(void)
 {
     city_resource_determine_available(0);
@@ -115,6 +135,9 @@ static void init(void)
     // We need to copy over the struct to prevent bugs when the trade prices window is shown
     memcpy(&data.list, list, sizeof(resource_list));
     grid_box_init(&resource_grid, data.list.size);
+#ifdef ENABLE_MULTIPLAYER
+    reset_route_selection();
+#endif
 }
 
 static int draw_background(void)
@@ -235,48 +258,49 @@ static void draw_resource_status_text(int resource, int x, int y, int box_width)
  * Shows P2P/AI tag and route state for resources that have active trade routes
  * involving player-owned cities.
  */
+static int advisor_local_trade_city(void)
+{
+    if (!net_session_is_active()) {
+        return -1;
+    }
+    return mp_ownership_find_local_city();
+}
+
 static void draw_mp_route_indicator(int resource, int x, int y, int width)
 {
     if (!net_session_is_active()) {
         return;
     }
 
-    /* Check all trade cities to see if this resource is traded through a player route */
+    int local_city_id = advisor_local_trade_city();
+    if (local_city_id < 0) {
+        return;
+    }
+
     int array_size = empire_city_get_array_size();
     int found_p2p_route = 0;
-    int found_route_id = -1;
+    int found_route = 0;
     mp_route_state worst_state = MP_ROUTE_STATE_ACTIVE;
 
     for (int i = 0; i < array_size; i++) {
-        const empire_city *city = empire_city_get(i);
-        if (!city->in_use || city->type != EMPIRE_CITY_TRADE || !city->is_open) {
+        trade_route_view view;
+        if (!trade_route_get_view_for_city_pair(local_city_id, i, &view) || view.route_id < 0) {
             continue;
         }
-        if (!empire_city_is_player_owned(i)) {
+        if (!view.counterpart_sells[resource] && !view.counterpart_buys[resource]) {
             continue;
         }
-        int route_id = city->route_id;
-        if (route_id < 0) {
-            continue;
-        }
-        /* Check if this route trades this resource */
-        int buys = city->buys_resource[resource];
-        int sells = city->sells_resource[resource];
-        if (!buys && !sells) {
-            continue;
-        }
-        /* Found a player route that trades this resource */
-        found_route_id = route_id;
-        if (mp_ownership_is_route_player_to_player(route_id)) {
+        found_route = 1;
+        if (view.is_player_to_player) {
             found_p2p_route = 1;
         }
-        mp_route_state rstate = mp_ownership_get_route_state(route_id);
+        mp_route_state rstate = (mp_route_state)view.state;
         if (rstate > worst_state) {
             worst_state = rstate;
         }
     }
 
-    if (found_route_id < 0) {
+    if (!found_route) {
         return;
     }
 
@@ -408,8 +432,61 @@ static void button_policy(const generic_button *button)
 
 static void button_resource(const grid_box_item *item)
 {
-    window_resource_settings_show(data.list.items[item->index]);
+    resource_type resource = data.list.items[item->index];
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        int local_city_id = advisor_local_trade_city();
+        if (local_city_id >= 0) {
+            route_selection_count = trade_route_collect_for_resource(
+                local_city_id, resource, route_selection_views, MAX_ROUTE_SELECTIONS);
+            route_selection_resource = resource;
+
+            if (route_selection_count == 1) {
+                window_resource_settings_show_for_route(resource, route_selection_views[0].route_id);
+                return;
+            }
+
+            if (route_selection_count > 1) {
+                generic_button anchor = {
+                    item->x,
+                    item->y,
+                    item->width,
+                    item->height,
+                    0,
+                    0,
+                    0,
+                    0
+                };
+
+                for (int i = 0; i < route_selection_count; i++) {
+                    const empire_city *counterpart = empire_city_get(route_selection_views[i].counterpart_city_id);
+                    const uint8_t *city_name = counterpart ? empire_city_get_name(counterpart) : (const uint8_t *)"?";
+                    string_copy(city_name, route_selection_labels[i], 80);
+                    route_selection_items[i] = route_selection_labels[i];
+                }
+
+                window_select_list_show_text(item->x, item->y, &anchor, route_selection_items,
+                    route_selection_count, button_resource_route_selected);
+                return;
+            }
+        }
+    }
+#endif
+    window_resource_settings_show(resource);
 }
+
+#ifdef ENABLE_MULTIPLAYER
+static void button_resource_route_selected(int index)
+{
+    if (index < 0 || index >= route_selection_count) {
+        return;
+    }
+    if (route_selection_views[index].route_id < 0 || route_selection_resource == RESOURCE_NONE) {
+        return;
+    }
+    window_resource_settings_show_for_route(route_selection_resource, route_selection_views[index].route_id);
+}
+#endif
 
 static void write_resource_storage_tooltip(tooltip_context *c, resource_type resource)
 {

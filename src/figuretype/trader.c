@@ -83,7 +83,20 @@ static struct {
     buy_multipliers buy_multiplier;
 } data;
 
-static int get_least_filled_quota_resource(building *b, int city_id, signed char trader_buying);
+static int get_least_filled_quota_resource(building *b, int city_id, int route_id, signed char trader_buying);
+
+static int trader_route_id_for_figure(const figure *f, int city_id)
+{
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active() && f) {
+        int route_id = mp_ownership_get_trader_route(f->id);
+        if (route_id > 0) {
+            return route_id;
+        }
+    }
+#endif
+    return empire_city_get_primary_legacy_route_id(city_id);
+}
 
 static int calculate_log_score(int baseline, int multiplier_min, int multiplier_max,
      int logarithmic_scaler, int input_value)
@@ -220,7 +233,7 @@ resource_type get_native_trader_buy_resource(building *b)
     return highest_resource;
 }
 
-static int trader_get_buy_resource(int building_id, int city_id)
+static int trader_get_buy_resource(int building_id, int city_id, int route_id)
 {
     //TODO: get all the logic of trade happening into this function, rather than decision making in the action function
     unsigned char land_trader = 1; // 1 = land trader, 0 = sea trader
@@ -232,7 +245,7 @@ static int trader_get_buy_resource(int building_id, int city_id)
     if (b->type == BUILDING_GRANARY && !config_get(CONFIG_GP_CH_ALLOW_EXPORTING_FROM_GRANARIES)) {
         return RESOURCE_NONE;
     }
-    int resource = get_least_filled_quota_resource(b, city_id, 1); // 1 = trader buying
+    int resource = get_least_filled_quota_resource(b, city_id, route_id, 1); // 1 = trader buying
     if (resource == RESOURCE_NONE && city_id == 0) { //native trader
         resource = building_storage_get_highest_quantity_resource(b);
     }
@@ -249,7 +262,7 @@ static int trader_get_buy_resource(int building_id, int city_id)
     return success ? resource : RESOURCE_NONE;
 }
 
-static int trader_get_sell_resource(int building_id, int city_id)
+static int trader_get_sell_resource(int building_id, int city_id, int route_id)
 {
     unsigned char land_trader = 1; // 1 = land trader, 0 = sea trader
     building *b = building_get(building_id);
@@ -257,7 +270,7 @@ static int trader_get_sell_resource(int building_id, int city_id)
         return RESOURCE_NONE;
     }
 
-    int resource = get_least_filled_quota_resource(b, city_id, 0); // 0 = trader selling
+    int resource = get_least_filled_quota_resource(b, city_id, route_id, 0); // 0 = trader selling
     if (resource == RESOURCE_NONE) {
         return RESOURCE_NONE;
     }
@@ -272,7 +285,7 @@ static int trader_get_sell_resource(int building_id, int city_id)
     return success ? resource : RESOURCE_NONE;
 }
 
-static int get_least_filled_quota_resource(building *b, int city_id, signed char trader_buying)
+static int get_least_filled_quota_resource(building *b, int city_id, int route_id, signed char trader_buying)
 {
     int r_start = (b->type == BUILDING_GRANARY) ? RESOURCE_MIN_FOOD : RESOURCE_MIN;
     int r_end = (b->type == BUILDING_GRANARY) ? RESOURCE_MAX_FOOD : RESOURCE_MAX;
@@ -280,7 +293,6 @@ static int get_least_filled_quota_resource(building *b, int city_id, signed char
     int best_resource = RESOURCE_NONE;
     int lowest_percent = 101; // Higher than max possible fill (100%)
 
-    int route_id = empire_city_get_route_id(city_id);
     int available = 0;
     for (int r = r_start; r < r_end; r++) {
         // Check if resource is available
@@ -334,7 +346,7 @@ static int get_closest_storage(const figure *f, int x, int y, int city_id, map_p
     resource_multiplier_init();
     int sellable[RESOURCE_MAX] = { 0 };
     int buyable[RESOURCE_MAX] = { 0 };
-    int route_id = empire_city_get_route_id(f->empire_city_id);
+    int route_id = trader_route_id_for_figure(f, f->empire_city_id);
     // 1. Determine what resources and how many can this caravan sell and buy
     for (int r = RESOURCE_MIN; r < RESOURCE_MAX; r++) {
         signed char resource_sell = empire_can_import_resource_from_city(city_id, r) ? 1 : 0;
@@ -533,12 +545,13 @@ void figure_trade_caravan_action(figure *f)
 #ifdef ENABLE_MULTIPLAYER
                 int is_auth = !net_session_is_active() || net_session_is_host();
 #endif
+                int active_route_id = trader_route_id_for_figure(f, f->empire_city_id);
                 if (figure_trade_caravan_can_buy(f, f->destination_building_id, f->empire_city_id)) {
 #ifdef ENABLE_MULTIPLAYER
                     if (is_auth) {
-                        int resource = trader_get_buy_resource(f->destination_building_id, f->empire_city_id);
+                        int resource = trader_get_buy_resource(f->destination_building_id, f->empire_city_id, active_route_id);
                         if (resource) {
-                            trade_route_increase_traded(empire_city_get_route_id(f->empire_city_id), resource, 1);
+                            trade_route_increase_traded(active_route_id, resource, 1);
                             trader_record_bought_resource(f->trader_id, resource);
                             city_health_update_sickness_level_in_building(f->destination_building_id);
                             f->trader_amount_bought++;
@@ -552,9 +565,9 @@ void figure_trade_caravan_action(figure *f)
                     /* Client: waits for host TRADE_EXECUTED events to update trader_amount_bought.
                      * figure_trade_caravan_can_buy() will return false once counter reaches limit. */
 #else
-                    int resource = trader_get_buy_resource(f->destination_building_id, f->empire_city_id);
+                    int resource = trader_get_buy_resource(f->destination_building_id, f->empire_city_id, active_route_id);
                     if (resource) {
-                        trade_route_increase_traded(empire_city_get_route_id(f->empire_city_id), resource, 1);
+                        trade_route_increase_traded(active_route_id, resource, 1);
                         trader_record_bought_resource(f->trader_id, resource);
                         city_health_update_sickness_level_in_building(f->destination_building_id);
                         f->trader_amount_bought++;
@@ -568,9 +581,9 @@ void figure_trade_caravan_action(figure *f)
                 if (figure_trade_caravan_can_sell(f, f->destination_building_id, f->empire_city_id)) {
 #ifdef ENABLE_MULTIPLAYER
                     if (is_auth) {
-                        int resource = trader_get_sell_resource(f->destination_building_id, f->empire_city_id);
+                        int resource = trader_get_sell_resource(f->destination_building_id, f->empire_city_id, active_route_id);
                         if (resource) {
-                            trade_route_increase_traded(empire_city_get_route_id(f->empire_city_id), resource, 0);
+                            trade_route_increase_traded(active_route_id, resource, 0);
                             trader_record_sold_resource(f->trader_id, resource);
                             city_health_update_sickness_level_in_building(f->destination_building_id);
                             f->loads_sold_or_carrying++;
@@ -583,9 +596,9 @@ void figure_trade_caravan_action(figure *f)
                     }
                     /* Client: waits for host TRADE_EXECUTED events to update loads_sold_or_carrying */
 #else
-                    int resource = trader_get_sell_resource(f->destination_building_id, f->empire_city_id);
+                    int resource = trader_get_sell_resource(f->destination_building_id, f->empire_city_id, active_route_id);
                     if (resource) {
-                        trade_route_increase_traded(empire_city_get_route_id(f->empire_city_id), resource, 0);
+                        trade_route_increase_traded(active_route_id, resource, 0);
                         trader_record_sold_resource(f->trader_id, resource);
                         city_health_update_sickness_level_in_building(f->destination_building_id);
                         f->loads_sold_or_carrying++;
@@ -1169,7 +1182,8 @@ int figure_trader_ship_get_distance_to_dock(const figure *ship, unsigned int doc
 
 int figure_trader_ship_other_ship_closer_to_dock(unsigned int dock_id, int distance)
 {
-    for (int route_id = 0; route_id < 20; route_id++) {
+    int route_count = trade_route_count();
+    for (int route_id = 0; route_id < route_count; route_id++) {
         if (empire_object_is_sea_trade_route(route_id) && empire_city_is_trade_route_open(route_id)) {
             int city_id = empire_city_get_for_trade_route(route_id);
             if (city_id != -1) {
@@ -1216,7 +1230,8 @@ void figure_trade_emit_event_if_host(const figure *f, int event_type)
 
     switch (event_type) {
         case 1: /* TRADER_SPAWNED */
-            mp_trade_sync_emit_trader_spawned(f->id, f->empire_city_id, -1);
+            mp_trade_sync_emit_trader_spawned(f->id, f->empire_city_id,
+                trader_route_id_for_figure(f, f->empire_city_id));
             break;
         case 3: /* TRADER_ABORTED */
             mp_trade_sync_emit_trader_aborted(f->id, 0);

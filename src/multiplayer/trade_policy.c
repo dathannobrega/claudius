@@ -37,6 +37,10 @@
 
 int mp_trade_policy_can_export_to(int city_id, int resource)
 {
+    trade_route_view route_view;
+    int local_city_id = net_session_is_active() ? mp_ownership_find_local_city() : -1;
+    int route_id = empire_city_get_primary_legacy_route_id(city_id);
+
     if (!resource_is_storable(resource)) {
         return 0;
     }
@@ -51,6 +55,15 @@ int mp_trade_policy_can_export_to(int city_id, int resource)
             return 0;
         }
         if (!view->importable[resource]) {
+            return 0;
+        }
+        if (!trade_route_get_view_for_city_pair(local_city_id, city_id, &route_view) ||
+            route_view.route_id < 0 || !route_view.is_open ||
+            !route_view.route_export_enabled[resource]) {
+            return 0;
+        }
+        if (route_view.route_export_limit[resource] > 0 &&
+            route_view.route_exported_this_year[resource] >= route_view.route_export_limit[resource]) {
             return 0;
         }
         /* Check our own local export capability */
@@ -73,8 +86,8 @@ int mp_trade_policy_can_export_to(int city_id, int resource)
     }
 
     /* Check route quota */
-    if (city_id && city->route_id >= 0 &&
-        trade_route_limit_reached(city->route_id, resource, 1)) {
+    if (city_id && route_id > 0 &&
+        trade_route_limit_reached(route_id, resource, 1)) {
         return 0;
     }
 
@@ -98,6 +111,10 @@ int mp_trade_policy_can_export_to(int city_id, int resource)
 
 int mp_trade_policy_can_import_from(int city_id, int resource)
 {
+    trade_route_view route_view;
+    int local_city_id = net_session_is_active() ? mp_ownership_find_local_city() : -1;
+    int route_id = empire_city_get_primary_legacy_route_id(city_id);
+
     if (!resource_is_storable(resource)) {
         return 0;
     }
@@ -112,6 +129,15 @@ int mp_trade_policy_can_import_from(int city_id, int resource)
             return 0;
         }
         if (!view->exportable[resource]) {
+            return 0;
+        }
+        if (!trade_route_get_view_for_city_pair(local_city_id, city_id, &route_view) ||
+            route_view.route_id < 0 || !route_view.is_open ||
+            !route_view.route_import_enabled[resource]) {
+            return 0;
+        }
+        if (route_view.route_import_limit[resource] > 0 &&
+            route_view.route_imported_this_year[resource] >= route_view.route_import_limit[resource]) {
             return 0;
         }
         /* Check our local import settings */
@@ -130,7 +156,7 @@ int mp_trade_policy_can_import_from(int city_id, int resource)
     if (!(city_resource_trade_status(resource) & TRADE_STATUS_IMPORT)) {
         return 0;
     }
-    if (city->route_id >= 0 && trade_route_limit_reached(city->route_id, resource, 0)) {
+    if (route_id > 0 && trade_route_limit_reached(route_id, resource, 0)) {
         return 0;
     }
     return 1;
