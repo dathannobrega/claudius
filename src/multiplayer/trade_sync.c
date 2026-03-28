@@ -2,6 +2,7 @@
 
 #ifdef ENABLE_MULTIPLAYER
 
+#include "mp_debug_log.h"
 #include "mp_trade_route.h"
 #include "ownership.h"
 #include "network/session.h"
