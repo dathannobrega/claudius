@@ -23,6 +23,7 @@
 #include "map/road_access.h"
 #ifdef ENABLE_MULTIPLAYER
 #include "multiplayer/ownership.h"
+#include "multiplayer/trade_execution.h"
 #include "multiplayer/trade_sync.h"
 #include "network/session.h"
 #endif
@@ -67,6 +68,12 @@ static int try_import_resource(int building_id, int resource, int city_id, int q
 
     int route_id = resolve_docker_route_id(city_id, ship_id);
     int result = 0;
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        return mp_trade_execute_storage_trade(route_id, resource, quantity, building_id,
+                                              0, 0, ship_id) == MP_TRADE_OK ? 1 : 0;
+    }
+#endif
     if (b->type == BUILDING_GRANARY) {
         result = building_granary_add_import(b, resource, 1, 0);
         if (result && route_id > 0) {
@@ -109,6 +116,12 @@ static int try_export_resource(int building_id, int resource, int city_id, int s
     }
     int route_id = resolve_docker_route_id(city_id, ship_id);
     int result = 0;
+#ifdef ENABLE_MULTIPLAYER
+    if (net_session_is_active()) {
+        return mp_trade_execute_storage_trade(route_id, resource, 1, building_id,
+                                              1, 0, ship_id) == MP_TRADE_OK ? 1 : 0;
+    }
+#endif
     if (b->type == BUILDING_GRANARY) {
         result = building_granary_remove_export(b, resource, 1, 0);
         if (result && route_id > 0) {

@@ -16,15 +16,66 @@ static struct {
     uint8_t slot_assigned[MP_MAX_PLAYERS]; /* 1 if slot is taken */
 } registry;
 
+static int fill_secure_random_bytes(uint8_t *out, size_t size)
+{
+    size_t offset = 0;
+
+    if (!out || size == 0) {
+        return 0;
+    }
+
+#if defined(_WIN32) && defined(_MSC_VER)
+    while (offset < size) {
+        unsigned int value = 0;
+        size_t chunk = size - offset;
+        if (chunk > sizeof(value)) {
+            chunk = sizeof(value);
+        }
+        if (rand_s(&value) != 0) {
+            break;
+        }
+        memcpy(out + offset, &value, chunk);
+        offset += chunk;
+    }
+#else
+    {
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f) {
+            offset = fread(out, 1, size, f);
+            fclose(f);
+        }
+    }
+#endif
+
+    if (offset == size) {
+        return 1;
+    }
+
+    for (; offset < size; offset++) {
+        out[offset] = (uint8_t)(random_from_pool((int)offset) ^
+                                (uint8_t)(random_from_stdlib() & 0xFF));
+    }
+    return 1;
+}
+
+static int secure_token_equals(const uint8_t *a, const uint8_t *b, size_t size)
+{
+    uint8_t diff = 0;
+
+    if (!a || !b) {
+        return 0;
+    }
+    for (size_t i = 0; i < size; i++) {
+        diff |= (uint8_t)(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
 /* ---- UUID generation ---- */
 
 void mp_player_registry_generate_uuid(uint8_t *out_uuid)
 {
-    /* Generate 128-bit pseudo-random UUID (version 4 variant 1).
-     * Uses core/random pool combined with time-based entropy. */
-    for (int i = 0; i < MP_PLAYER_UUID_SIZE; i++) {
-        out_uuid[i] = (uint8_t)(random_from_pool(i) ^ (uint8_t)(rand() & 0xFF));
-    }
+    fill_secure_random_bytes(out_uuid, MP_PLAYER_UUID_SIZE);
     /* Set version 4 (random) */
     out_uuid[6] = (out_uuid[6] & 0x0F) | 0x40;
     /* Set variant 1 */
@@ -54,9 +105,7 @@ void mp_player_registry_uuid_to_string(const uint8_t *uuid, char *out, int out_s
 
 static void generate_reconnect_token(uint8_t *token)
 {
-    for (int i = 0; i < MP_RECONNECT_TOKEN_SIZE; i++) {
-        token[i] = (uint8_t)(random_from_pool(i + 16) ^ (uint8_t)(rand() & 0xFF));
-    }
+    fill_secure_random_bytes(token, MP_RECONNECT_TOKEN_SIZE);
 }
 
 /* ---- Init / Clear ---- */
@@ -176,6 +225,17 @@ mp_player *mp_player_registry_get_host(void)
         }
     }
     return 0;
+}
+
+const char *mp_player_registry_display_name(const mp_player *player)
+{
+    if (!player) {
+        return "";
+    }
+    if (player->display_name[0]) {
+        return player->display_name;
+    }
+    return player->name;
 }
 
 mp_player *mp_player_registry_get_by_uuid(const uint8_t *uuid)
@@ -310,14 +370,24 @@ void mp_player_registry_generate_reconnect_token(uint8_t player_id)
 int mp_player_registry_validate_reconnect(const uint8_t *uuid, const uint8_t *token)
 {
     mp_player *p = mp_player_registry_get_by_uuid(uuid);
-    if (!p) {
+    int token_is_nonzero = 0;
+    if (!p || !token) {
         return 0;
     }
     if (p->status != MP_PLAYER_DISCONNECTED &&
         p->status != MP_PLAYER_AWAITING_RECONNECT) {
         return 0;
     }
-    return memcmp(p->reconnect_token, token, MP_RECONNECT_TOKEN_SIZE) == 0;
+    for (int i = 0; i < MP_RECONNECT_TOKEN_SIZE; i++) {
+        if (token[i] != 0) {
+            token_is_nonzero = 1;
+            break;
+        }
+    }
+    if (!token_is_nonzero) {
+        return 0;
+    }
+    return secure_token_equals(p->reconnect_token, token, MP_RECONNECT_TOKEN_SIZE);
 }
 
 void mp_player_registry_mark_disconnected(uint8_t player_id, uint32_t current_tick,
@@ -445,6 +515,7 @@ void mp_player_registry_serialize(uint8_t *buffer, uint32_t *size)
         net_write_u32(&s, p->commands_sent);
         net_write_u32(&s, p->commands_rejected);
         net_write_u32(&s, p->resyncs_requested);
+        net_write_u32(&s, p->last_command_sequence_accepted);
     }
 
     /* Slot assignment table */
@@ -508,6 +579,7 @@ void mp_player_registry_deserialize(const uint8_t *buffer, uint32_t size)
         p->commands_sent = net_read_u32(&s);
         p->commands_rejected = net_read_u32(&s);
         p->resyncs_requested = net_read_u32(&s);
+        p->last_command_sequence_accepted = net_read_u32(&s);
 
         registry.count++;
     }

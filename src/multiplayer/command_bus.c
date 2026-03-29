@@ -2,11 +2,14 @@
 
 #ifdef ENABLE_MULTIPLAYER
 
+#include "mp_debug_log.h"
 #include "mp_trade_route.h"
 #include "mp_autosave.h"
 #include "trade_execution.h"
 #include "ownership.h"
 #include "player_registry.h"
+#include "resync.h"
+#include "time_sync.h"
 #include "trade_policy.h"
 #include "trade_sync.h"
 #include "empire_sync.h"
@@ -24,6 +27,7 @@
 #include <string.h>
 
 #define MAX_PLAYER_ROUTES 10  /* Max active routes per player */
+#define MAX_QUEUED_COMMANDS_PER_PLAYER 16
 
 static struct {
     mp_command queue[MP_COMMAND_QUEUE_SIZE];
@@ -33,7 +37,18 @@ static struct {
     uint32_t next_sequence_id;
     mp_command_status last_status;
     uint8_t last_reject_reason;
+    uint32_t last_sequence_by_player[MP_MAX_PLAYERS];
+    uint8_t queued_commands_by_player[MP_MAX_PLAYERS];
 } bus;
+
+static void seed_sequence_watermarks_from_registry(void)
+{
+    for (int i = 0; i < MP_MAX_PLAYERS; i++) {
+        mp_player *player = mp_player_registry_get((uint8_t)i);
+        bus.last_sequence_by_player[i] =
+            player ? player->last_command_sequence_accepted : 0;
+    }
+}
 
 static int local_city_has_sea_access(void)
 {
@@ -125,6 +140,7 @@ void mp_command_bus_init(void)
 {
     memset(&bus, 0, sizeof(bus));
     bus.next_sequence_id = 1;
+    seed_sequence_watermarks_from_registry();
 }
 
 void mp_command_bus_init_from_save(uint32_t next_sequence_id)
@@ -133,6 +149,7 @@ void mp_command_bus_init_from_save(uint32_t next_sequence_id)
      * This ensures command IDs never repeat after resume. */
     memset(&bus, 0, sizeof(bus));
     bus.next_sequence_id = (next_sequence_id > 0) ? next_sequence_id : 1;
+    seed_sequence_watermarks_from_registry();
 }
 
 void mp_command_bus_clear(void)
@@ -352,6 +369,13 @@ static int validate_set_route_limit(const mp_command *cmd)
 
 static int validate_command(const mp_command *cmd)
 {
+    if ((mp_time_sync_is_join_barrier_active() ||
+         mp_resync_is_in_progress() ||
+         mp_autosave_is_save_in_progress()) &&
+        cmd->command_type != MP_CMD_CHAT_MESSAGE) {
+        return MP_CMD_REJECT_SESSION_BUSY;
+    }
+
     switch (cmd->command_type) {
         case MP_CMD_CREATE_TRADE_ROUTE:
             return validate_create_trade_route(cmd);
@@ -377,6 +401,10 @@ static int validate_command(const mp_command *cmd)
             if (!city || !city->in_use) {
                 return MP_CMD_REJECT_CITY_NOT_FOUND;
             }
+            if (mp_ownership_is_city_player_owned(city_id) &&
+                mp_ownership_get_city_player_id(city_id) == cmd->player_id) {
+                return MP_CMD_REJECT_INVALID;
+            }
             if (city->is_open) {
                 return MP_CMD_REJECT_ALREADY_OPEN;
             }
@@ -392,6 +420,10 @@ static int validate_command(const mp_command *cmd)
             empire_city *city = empire_city_get(city_id);
             if (!city || !city->in_use) {
                 return MP_CMD_REJECT_CITY_NOT_FOUND;
+            }
+            if (mp_ownership_is_city_player_owned(city_id) &&
+                mp_ownership_get_city_player_id(city_id) == cmd->player_id) {
+                return MP_CMD_REJECT_INVALID;
             }
             if (!city->is_open) {
                 return MP_CMD_REJECT_ALREADY_CLOSED;
@@ -444,6 +476,9 @@ static int validate_command(const mp_command *cmd)
                 return MP_CMD_REJECT_CITY_NOT_FOUND;
             }
             if (b->type != BUILDING_WAREHOUSE && b->type != BUILDING_GRANARY) {
+                return MP_CMD_REJECT_INVALID;
+            }
+            if (cmd->data.storage_permission.permission > BUILDING_STORAGE_PERMISSION_CAESAR) {
                 return MP_CMD_REJECT_INVALID;
             }
             return MP_CMD_REJECT_NONE;
@@ -574,7 +609,7 @@ static void apply_command(mp_command *cmd)
 
             /* Register in ownership */
             if (mp_ownership_create_route(route_id, mode, cmd->player_id,
-                    dest_is_player ? dest_player : 0,
+                    dest_is_player ? dest_player : 0xFF,
                     data->origin_city_id, data->dest_city_id, network_id) < 0) {
                 cmd->status = MP_CMD_STATUS_REJECTED;
                 return;
@@ -587,6 +622,7 @@ static void apply_command(mp_command *cmd)
              * P2P instance before mutating any city-facing compatibility state. */
             trade_route_set_player_binding(route_id, cmd->player_id,
                 dest_is_player ? dest_player : 0xFF);
+            trade_route_set_network_id(route_id, (int)network_id);
             route_instance_id = mp_trade_route_create(
                 cmd->player_id, data->origin_city_id,
                 dest_is_player ? dest_player : 0xFF, data->dest_city_id,
@@ -862,11 +898,14 @@ static void apply_command(mp_command *cmd)
         case MP_CMD_SET_STORAGE_PERMISSION: {
             const mp_cmd_set_storage_permission *data = &cmd->data.storage_permission;
             building *b = building_get(data->building_id);
+            int enabled = 0;
             if (b) {
                 building_storage_toggle_permission(data->permission, b);
+                enabled = building_storage_get_permission(
+                    (building_storage_permission_states)data->permission, b);
             }
             /* Broadcast to all clients */
-            uint8_t event_buf[32];
+            uint8_t event_buf[40];
             net_serializer es;
             net_serializer_init(&es, event_buf, sizeof(event_buf));
             net_write_u16(&es, NET_EVENT_STORAGE_PERMISSION_CHANGED);
@@ -874,6 +913,7 @@ static void apply_command(mp_command *cmd)
             net_write_u8(&es, cmd->player_id);
             net_write_i32(&es, data->building_id);
             net_write_u8(&es, data->permission);
+            net_write_u8(&es, (uint8_t)enabled);
             net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
                                   (uint32_t)net_serializer_position(&es));
             break;
@@ -975,6 +1015,28 @@ void multiplayer_command_bus_receive(uint8_t player_id,
         send_ack(player_id, cmd.sequence_id, 0, MP_CMD_REJECT_PLAYER_DISCONNECTED);
         return;
     }
+    if (player_id >= MP_MAX_PLAYERS || cmd.sequence_id == 0) {
+        send_ack(player_id, cmd.sequence_id, 0, MP_CMD_REJECT_SEQUENCE_INVALID);
+        return;
+    }
+    if (cmd.sequence_id <= bus.last_sequence_by_player[player_id]) {
+        MP_LOG_WARN("CMD", "Rejected replay/out-of-order command from player %d seq=%u last=%u",
+                    (int)player_id, cmd.sequence_id, bus.last_sequence_by_player[player_id]);
+        send_ack(player_id, cmd.sequence_id, 0, MP_CMD_REJECT_SEQUENCE_INVALID);
+        if (player) player->commands_rejected++;
+        return;
+    }
+    if (bus.queued_commands_by_player[player_id] >= MAX_QUEUED_COMMANDS_PER_PLAYER) {
+        MP_LOG_WARN("CMD", "Rejected rate-limited command from player %d seq=%u queued=%u",
+                    (int)player_id, cmd.sequence_id, bus.queued_commands_by_player[player_id]);
+        send_ack(player_id, cmd.sequence_id, 0, MP_CMD_REJECT_RATE_LIMITED);
+        if (player) player->commands_rejected++;
+        return;
+    }
+    bus.last_sequence_by_player[player_id] = cmd.sequence_id;
+    if (player) {
+        player->last_command_sequence_accepted = cmd.sequence_id;
+    }
 
     int reject = validate_command(&cmd);
     if (reject) {
@@ -993,6 +1055,7 @@ void multiplayer_command_bus_receive(uint8_t player_id,
         send_ack(player_id, cmd.sequence_id, 0, MP_CMD_REJECT_INVALID);
         return;
     }
+    bus.queued_commands_by_player[player_id]++;
 
     send_ack(player_id, cmd.sequence_id, 1, 0);
 }
@@ -1026,12 +1089,18 @@ void mp_command_bus_process_pending(uint32_t current_tick)
         if (!cmd) {
             break;
         }
+        if (cmd->player_id < MP_MAX_PLAYERS && bus.queued_commands_by_player[cmd->player_id] > 0) {
+            bus.queued_commands_by_player[cmd->player_id]--;
+        }
 
         if (cmd->target_tick <= current_tick) {
             apply_command(cmd);
             processed++;
         } else {
             enqueue_command(cmd);
+            if (cmd->player_id < MP_MAX_PLAYERS) {
+                bus.queued_commands_by_player[cmd->player_id]++;
+            }
         }
     }
 
@@ -1068,6 +1137,9 @@ const char *mp_command_bus_reject_reason_text(uint8_t reason)
         case MP_CMD_REJECT_ROUTE_ALREADY_ENABLED: return "Rota ja habilitada";
         case MP_CMD_REJECT_ROUTE_ALREADY_DISABLED: return "Rota ja desabilitada";
         case MP_CMD_REJECT_PLAYER_DISCONNECTED: return "Jogador desconectado";
+        case MP_CMD_REJECT_SEQUENCE_INVALID: return "Sequencia invalida";
+        case MP_CMD_REJECT_RATE_LIMITED: return "Muitas acoes em fila";
+        case MP_CMD_REJECT_SESSION_BUSY: return "Sessao ocupada";
         case MP_CMD_REJECT_RESOURCE_INVALID: return "Recurso invalido";
         case MP_CMD_REJECT_INVALID:
         default:

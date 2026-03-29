@@ -24,6 +24,7 @@
 #include "core/log.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 static mp_trade_route_instance *resolve_empire_route(int route_id,
                                                      uint32_t network_route_id)
@@ -166,15 +167,24 @@ void mp_empire_sync_broadcast_views(void)
         return;
     }
 
-    uint8_t buf[8192];
+    uint8_t *buf = (uint8_t *)malloc(NET_MAX_PAYLOAD_SIZE);
     uint32_t size = 0;
+    if (!buf) {
+        log_error("Failed to allocate empire sync payload buffer", 0, NET_MAX_PAYLOAD_SIZE);
+        return;
+    }
     mp_empire_sync_serialize(buf, &size);
 
     if (size > 0) {
         /* Wrap as HOST_EVENT with CITY_VIEW_UPDATED type */
-        uint8_t event_buf[8192 + 16];
+        uint8_t *event_buf = (uint8_t *)malloc(size + 16);
         net_serializer s;
-        net_serializer_init(&s, event_buf, sizeof(event_buf));
+        if (!event_buf) {
+            free(buf);
+            log_error("Failed to allocate empire sync event buffer", 0, (int)(size + 16));
+            return;
+        }
+        net_serializer_init(&s, event_buf, size + 16);
         net_write_u16(&s, NET_EVENT_CITY_VIEW_UPDATED);
         net_write_u32(&s, net_session_get_authoritative_tick());
         net_write_u32(&s, size);
@@ -182,8 +192,10 @@ void mp_empire_sync_broadcast_views(void)
 
         net_session_broadcast(NET_MSG_HOST_EVENT, event_buf,
                             (uint32_t)net_serializer_position(&s));
+        free(event_buf);
     }
 
+    free(buf);
     sync_data.dirty = 0;
 }
 
@@ -239,7 +251,7 @@ int mp_empire_sync_can_import_from_remote(int city_id, int resource)
 void mp_empire_sync_serialize(uint8_t *buffer, uint32_t *size)
 {
     net_serializer s;
-    net_serializer_init(&s, buffer, 8192);
+    net_serializer_init(&s, buffer, NET_MAX_PAYLOAD_SIZE);
 
     net_write_u16(&s, (uint16_t)sync_data.view_count);
 
@@ -256,6 +268,12 @@ void mp_empire_sync_serialize(uint8_t *buffer, uint32_t *size)
             net_write_u8(&s, (uint8_t)v->importable[r]);
             net_write_i32(&s, v->stock_level[r]);
         }
+    }
+
+    if (net_serializer_has_overflow(&s)) {
+        log_error("Empire sync serialization overflow", 0, sync_data.view_count);
+        *size = 0;
+        return;
     }
 
     *size = (uint32_t)net_serializer_position(&s);
@@ -342,6 +360,7 @@ static void handle_route_lifecycle_event(uint16_t event_type, net_serializer *s)
             /* Bind players to route in trade_route system */
             trade_route_set_player_binding(route_id, origin_player_id,
                 dest_player_id != 0xFF ? dest_player_id : 0xFF);
+            trade_route_set_network_id(route_id, (int)network_route_id);
 
             /* Mirror the authoritative P2P route entity using the host instance_id. */
             if (!mp_trade_route_get(instance_id)) {
@@ -741,10 +760,12 @@ void multiplayer_empire_sync_receive_event(const uint8_t *data, uint32_t size)
             uint8_t player_id = net_read_u8(&s);
             int building_id = net_read_i32(&s);
             uint8_t permission = net_read_u8(&s);
+            uint8_t enabled = net_read_u8(&s);
             if (!net_serializer_has_overflow(&s)) {
                 building *b = building_get(building_id);
                 if (b) {
-                    building_storage_toggle_permission(permission, b);
+                    building_storage_set_permission(
+                        (building_storage_permission_states)permission, b, enabled ? 1 : 0);
                 }
             }
             (void)player_id;

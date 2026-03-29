@@ -61,11 +61,6 @@ static void on_return(window_id from);
 static generic_button client_buttons[3];
 static generic_button host_buttons[2];
 
-static const uint8_t local_text[] = "Local";
-static const uint8_t awaiting_text[] = "Awaiting";
-static const uint8_t offline_text[] = "Offline";
-static const uint8_t desynced_text[] = "Desynced";
-
 static list_box_type player_list = {
     .x = LIST_X,
     .y = LIST_Y,
@@ -164,20 +159,20 @@ static const uint8_t *player_override_text(const mp_player *player, font_t *font
 {
     if (player->status == MP_PLAYER_AWAITING_RECONNECT) {
         *font = FONT_NORMAL_BROWN;
-        return awaiting_text;
+        return translation_for(TR_MP_STATUS_AWAITING);
     }
     if (player->status == MP_PLAYER_DESYNCED) {
         *font = FONT_NORMAL_RED;
-        return desynced_text;
+        return translation_for(TR_MP_STATUS_DESYNCED);
     }
     if (player->connection_state == MP_CONNECTION_DISCONNECTED ||
         player->status == MP_PLAYER_DISCONNECTED) {
         *font = FONT_NORMAL_RED;
-        return offline_text;
+        return translation_for(TR_MP_EMPIRE_OFFLINE);
     }
     if (player->is_local) {
         *font = FONT_NORMAL_PLAIN;
-        return local_text;
+        return translation_for(TR_MP_STATUS_LOCAL);
     }
     return 0;
 }
@@ -194,23 +189,24 @@ static void draw_player_item(const list_box_item *item)
     }
 
     {
+        int ping_box_width = QUALITY_COLUMN_X - PING_COLUMN_X - 10;
+        int quality_box_width = item->x + item->width - QUALITY_COLUMN_X - 8;
         font_t name_font = item->is_focused ? FONT_NORMAL_WHITE : FONT_NORMAL_GREEN;
         uint8_t name_buf[64];
-        string_copy(string_from_ascii(player->name), name_buf, sizeof(name_buf));
+        string_copy(string_from_ascii(mp_player_registry_display_name(player)), name_buf, sizeof(name_buf));
         text_ellipsize(name_buf, name_font, HOST_COLUMN_X - NAME_COLUMN_X - 12);
         text_draw(name_buf, NAME_COLUMN_X, item->y + 2, name_font, 0);
-    }
 
-    if (player->is_host) {
-        const uint8_t *host_label = translation_for(TR_MP_HOST);
-        text_draw(host_label, HOST_COLUMN_X, item->y + 2, FONT_NORMAL_BROWN, 0);
-    }
+        if (player->is_host) {
+            const uint8_t *host_label = translation_for(TR_MP_HOST);
+            text_draw(host_label, HOST_COLUMN_X, item->y + 2, FONT_NORMAL_BROWN, 0);
+        }
 
-    {
         font_t override_font = FONT_NORMAL_PLAIN;
         const uint8_t *override_text = player_override_text(player, &override_font);
         if (override_text) {
-            text_draw(override_text, PING_COLUMN_X, item->y + 2, override_font, 0);
+            text_draw_ellipsized(override_text, PING_COLUMN_X, item->y + 2,
+                item->x + item->width - PING_COLUMN_X - 8, override_font, 0);
         } else {
             const net_peer *peer = find_player_peer(player->player_id);
             if (peer) {
@@ -218,13 +214,14 @@ static void draw_player_item(const list_box_item *item)
                 uint8_t ping_buf[16];
                 snprintf(ping_str, sizeof(ping_str), "%u ms", peer->rtt_smoothed_ms);
                 string_copy(string_from_ascii(ping_str), ping_buf, sizeof(ping_buf));
-                text_draw(ping_buf, PING_COLUMN_X, item->y + 2, FONT_NORMAL_PLAIN, 0);
+                text_draw_ellipsized(ping_buf, PING_COLUMN_X, item->y + 2,
+                    ping_box_width, FONT_NORMAL_PLAIN, 0);
 
                 {
                     translation_key qkey = quality_translation(peer->quality);
                     const uint8_t *qtext = translation_for(qkey);
-                    text_draw(qtext, QUALITY_COLUMN_X, item->y + 2,
-                        quality_font(peer->quality), 0);
+                    text_draw_ellipsized(qtext, QUALITY_COLUMN_X, item->y + 2,
+                        quality_box_width, quality_font(peer->quality), 0);
                 }
             }
         }

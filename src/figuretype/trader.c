@@ -28,6 +28,7 @@
 #include "empire/trade_prices.h"
 #include "empire/trade_route.h"
 #ifdef ENABLE_MULTIPLAYER
+#include "multiplayer/trade_execution.h"
 #include "multiplayer/trade_sync.h"
 #include "multiplayer/ownership.h"
 #include "network/session.h"
@@ -233,7 +234,8 @@ resource_type get_native_trader_buy_resource(building *b)
     return highest_resource;
 }
 
-static int trader_get_buy_resource(int building_id, int city_id, int route_id)
+static int trader_choose_buy_resource(int building_id, int city_id, int route_id,
+                                      int mutate_storage)
 {
     //TODO: get all the logic of trade happening into this function, rather than decision making in the action function
     unsigned char land_trader = 1; // 1 = land trader, 0 = sea trader
@@ -252,6 +254,9 @@ static int trader_get_buy_resource(int building_id, int city_id, int route_id)
     if (resource == RESOURCE_NONE) {
         return RESOURCE_NONE;
     }
+    if (!mutate_storage) {
+        return resource;
+    }
     unsigned char success = 0;
     if (b->type == BUILDING_GRANARY) {
         success = building_granary_remove_export(b, resource, 1, land_trader);
@@ -262,7 +267,13 @@ static int trader_get_buy_resource(int building_id, int city_id, int route_id)
     return success ? resource : RESOURCE_NONE;
 }
 
-static int trader_get_sell_resource(int building_id, int city_id, int route_id)
+static int trader_get_buy_resource(int building_id, int city_id, int route_id)
+{
+    return trader_choose_buy_resource(building_id, city_id, route_id, 1);
+}
+
+static int trader_choose_sell_resource(int building_id, int city_id, int route_id,
+                                       int mutate_storage)
 {
     unsigned char land_trader = 1; // 1 = land trader, 0 = sea trader
     building *b = building_get(building_id);
@@ -274,6 +285,9 @@ static int trader_get_sell_resource(int building_id, int city_id, int route_id)
     if (resource == RESOURCE_NONE) {
         return RESOURCE_NONE;
     }
+    if (!mutate_storage) {
+        return resource;
+    }
 
     unsigned char success = 0;
     if (b->type == BUILDING_GRANARY) {
@@ -283,6 +297,11 @@ static int trader_get_sell_resource(int building_id, int city_id, int route_id)
     }
 
     return success ? resource : RESOURCE_NONE;
+}
+
+static int trader_get_sell_resource(int building_id, int city_id, int route_id)
+{
+    return trader_choose_sell_resource(building_id, city_id, route_id, 1);
 }
 
 static int get_least_filled_quota_resource(building *b, int city_id, int route_id, signed char trader_buying)
@@ -549,14 +568,21 @@ void figure_trade_caravan_action(figure *f)
                 if (figure_trade_caravan_can_buy(f, f->destination_building_id, f->empire_city_id)) {
 #ifdef ENABLE_MULTIPLAYER
                     if (is_auth) {
-                        int resource = trader_get_buy_resource(f->destination_building_id, f->empire_city_id, active_route_id);
+                        int resource = net_session_is_active()
+                            ? trader_choose_buy_resource(f->destination_building_id,
+                                f->empire_city_id, active_route_id, 0)
+                            : trader_get_buy_resource(f->destination_building_id,
+                                f->empire_city_id, active_route_id);
                         if (resource) {
-                            trade_route_increase_traded(active_route_id, resource, 1);
-                            trader_record_bought_resource(f->trader_id, resource);
-                            city_health_update_sickness_level_in_building(f->destination_building_id);
-                            f->trader_amount_bought++;
-                            if (net_session_is_active()) {
-                                mp_trade_sync_emit_trader_trade_executed(f->id, resource, 1, 1, f->destination_building_id);
+                            if (!net_session_is_active() ||
+                                mp_trade_execute_storage_trade(active_route_id, resource, 1,
+                                                               f->destination_building_id,
+                                                               1, 1, f->id) == MP_TRADE_OK) {
+                                trader_record_bought_resource(f->trader_id, resource);
+                                city_health_update_sickness_level_in_building(f->destination_building_id);
+                                f->trader_amount_bought++;
+                            } else {
+                                move_on++;
                             }
                         } else {
                             move_on++;
@@ -581,14 +607,21 @@ void figure_trade_caravan_action(figure *f)
                 if (figure_trade_caravan_can_sell(f, f->destination_building_id, f->empire_city_id)) {
 #ifdef ENABLE_MULTIPLAYER
                     if (is_auth) {
-                        int resource = trader_get_sell_resource(f->destination_building_id, f->empire_city_id, active_route_id);
+                        int resource = net_session_is_active()
+                            ? trader_choose_sell_resource(f->destination_building_id,
+                                f->empire_city_id, active_route_id, 0)
+                            : trader_get_sell_resource(f->destination_building_id,
+                                f->empire_city_id, active_route_id);
                         if (resource) {
-                            trade_route_increase_traded(active_route_id, resource, 0);
-                            trader_record_sold_resource(f->trader_id, resource);
-                            city_health_update_sickness_level_in_building(f->destination_building_id);
-                            f->loads_sold_or_carrying++;
-                            if (net_session_is_active()) {
-                                mp_trade_sync_emit_trader_trade_executed(f->id, resource, 1, 0, f->destination_building_id);
+                            if (!net_session_is_active() ||
+                                mp_trade_execute_storage_trade(active_route_id, resource, 1,
+                                                               f->destination_building_id,
+                                                               0, 1, f->id) == MP_TRADE_OK) {
+                                trader_record_sold_resource(f->trader_id, resource);
+                                city_health_update_sickness_level_in_building(f->destination_building_id);
+                                f->loads_sold_or_carrying++;
+                            } else {
+                                move_on++;
                             }
                         } else {
                             move_on++;

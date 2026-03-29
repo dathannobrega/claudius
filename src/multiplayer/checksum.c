@@ -7,6 +7,7 @@
 #include "ownership.h"
 #include "player_registry.h"
 #include "resync.h"
+#include "snapshot.h"
 #include "time_sync.h"
 #include "trade_sync.h"
 #include "worldgen.h"
@@ -17,8 +18,7 @@
 #include "core/log.h"
 
 #include <string.h>
-
-#define CHECKSUM_DOMAIN_BUFFER_SIZE 32768
+#include <stdlib.h>
 
 static struct {
     uint32_t last_check_tick;
@@ -62,10 +62,7 @@ static uint32_t fnv1a_i32(uint32_t hash, int32_t value)
 static uint32_t hash_domain_bytes(uint32_t hash, const char *label,
                                   const uint8_t *buffer, uint32_t size)
 {
-    if (size > CHECKSUM_DOMAIN_BUFFER_SIZE) {
-        log_error("Checksum domain too large", label, (int)size);
-        size = CHECKSUM_DOMAIN_BUFFER_SIZE;
-    }
+    (void)label;
     hash = fnv1a_u32(hash, size);
     if (size > 0) {
         hash = fnv1a_update(hash, buffer, size);
@@ -76,8 +73,13 @@ static uint32_t hash_domain_bytes(uint32_t hash, const char *label,
 uint32_t mp_checksum_compute(void)
 {
     uint32_t hash = fnv1a_init();
-    uint8_t buffer[CHECKSUM_DOMAIN_BUFFER_SIZE];
+    uint8_t *buffer = (uint8_t *)malloc(MP_SNAPSHOT_MAX_SIZE);
     uint32_t size = 0;
+
+    if (!buffer) {
+        log_error("Failed to allocate checksum domain buffer", 0, MP_SNAPSHOT_MAX_SIZE);
+        return hash;
+    }
 
     /* Hash canonical time state only. Avoid local client-only counters. */
     hash = fnv1a_u32(hash, net_session_get_authoritative_tick());
@@ -88,30 +90,31 @@ uint32_t mp_checksum_compute(void)
     hash = fnv1a_i32(hash, game_time_day());
     hash = fnv1a_i32(hash, game_time_tick());
 
-    memset(buffer, 0, sizeof(buffer));
+    memset(buffer, 0, MP_SNAPSHOT_MAX_SIZE);
     mp_ownership_serialize(buffer, &size);
     hash = hash_domain_bytes(hash, "ownership", buffer, size);
 
-    memset(buffer, 0, sizeof(buffer));
+    memset(buffer, 0, MP_SNAPSHOT_MAX_SIZE);
     mp_empire_sync_serialize(buffer, &size);
     hash = hash_domain_bytes(hash, "empire_sync", buffer, size);
 
-    memset(buffer, 0, sizeof(buffer));
+    memset(buffer, 0, MP_SNAPSHOT_MAX_SIZE);
     mp_trade_sync_serialize_routes(buffer, &size);
     hash = hash_domain_bytes(hash, "trade_routes_legacy", buffer, size);
 
-    memset(buffer, 0, sizeof(buffer));
+    memset(buffer, 0, MP_SNAPSHOT_MAX_SIZE);
     mp_trade_sync_serialize_traders(buffer, &size);
     hash = hash_domain_bytes(hash, "trade_traders", buffer, size);
 
-    memset(buffer, 0, sizeof(buffer));
-    mp_trade_route_serialize(buffer, &size, sizeof(buffer));
+    memset(buffer, 0, MP_SNAPSHOT_MAX_SIZE);
+    mp_trade_route_serialize(buffer, &size, MP_SNAPSHOT_MAX_SIZE);
     hash = hash_domain_bytes(hash, "trade_routes_p2p", buffer, size);
 
-    memset(buffer, 0, sizeof(buffer));
+    memset(buffer, 0, MP_SNAPSHOT_MAX_SIZE);
     mp_worldgen_serialize(buffer, &size);
     hash = hash_domain_bytes(hash, "worldgen", buffer, size);
 
+    free(buffer);
     return hash;
 }
 

@@ -247,15 +247,14 @@ void mp_trade_sync_emit_trader_trade_executed(int figure_id, int resource,
     uint32_t route_instance_id = 0;
     int route_id = t ? t->route_id : mp_ownership_get_trader_route(figure_id);
     if (route_id >= 0) {
-        mp_trade_route_instance *mpr = mp_trade_route_find_by_claudius_route(route_id);
+        uint32_t network_route_id = (uint32_t)trade_route_get_network_id(route_id);
+        mp_trade_route_instance *mpr;
+        if (network_route_id == 0) {
+            network_route_id = mp_ownership_get_network_route_id(route_id);
+        }
+        mpr = mp_trade_route_resolve(route_id, network_route_id);
         if (mpr) {
             route_instance_id = mpr->instance_id;
-            /* Also record in the mp_trade_route counters */
-            if (buying) {
-                mp_trade_route_record_import(route_instance_id, resource, amount);
-            } else {
-                mp_trade_route_record_export(route_instance_id, resource, amount);
-            }
         }
     }
 
@@ -490,7 +489,7 @@ void mp_trade_sync_handle_event(uint16_t event_type,
             uint32_t version = net_read_u32(&s);
 
             replicated_trader *t = alloc_trader(figure_id);
-            if (t) {
+            if (t && version >= t->state_version) {
                 t->network_entity_id = net_id;
                 t->city_id = city_id;
                 t->route_id = route_id;
@@ -506,7 +505,7 @@ void mp_trade_sync_handle_event(uint16_t event_type,
             uint32_t version = net_read_u32(&s);
 
             replicated_trader *t = find_trader(figure_id);
-            if (t) {
+            if (t && version >= t->state_version) {
                 t->state = TRADER_STATE_AT_STORAGE;
                 t->state_version = version;
             }
@@ -530,6 +529,9 @@ void mp_trade_sync_handle_event(uint16_t event_type,
             mp_trade_route_instance *mpr = resolve_trade_event_route(route_instance_id, route_id);
             int trader_type = 0;
             int applied_amount = amount > 0 ? amount : 1;
+            if (t && version <= t->state_version) {
+                break;
+            }
             if (mpr) {
                 trader_type = (mpr->transport == MP_TROUTE_LAND) ? 1 : 0;
             } else {
@@ -596,7 +598,7 @@ void mp_trade_sync_handle_event(uint16_t event_type,
             uint32_t version = net_read_u32(&s);
 
             replicated_trader *t = find_trader(figure_id);
-            if (t) {
+            if (t && version >= t->state_version) {
                 t->state = TRADER_STATE_RETURNING;
                 t->state_version = version;
             }
@@ -610,7 +612,7 @@ void mp_trade_sync_handle_event(uint16_t event_type,
             uint32_t version = net_read_u32(&s);
 
             replicated_trader *t = find_trader(figure_id);
-            if (t) {
+            if (t && version >= t->state_version) {
                 t->state = TRADER_STATE_ABORTED;
                 t->state_version = version;
             }
@@ -688,7 +690,7 @@ int mp_trade_sync_get_trader_route(int figure_id)
 void mp_trade_sync_serialize_routes(uint8_t *buffer, uint32_t *size)
 {
     net_serializer s;
-    net_serializer_init(&s, buffer, 16384);
+    net_serializer_init(&s, buffer, NET_MAX_PAYLOAD_SIZE);
 
     int route_count = trade_route_count();
     net_write_i32(&s, route_count);
@@ -704,6 +706,12 @@ void mp_trade_sync_serialize_routes(uint8_t *buffer, uint32_t *size)
             net_write_i32(&s, trade_route_limit(i, r, 1));
             net_write_i32(&s, trade_route_traded(i, r, 1));
         }
+    }
+
+    if (net_serializer_has_overflow(&s)) {
+        log_error("Trade route serialization overflow", 0, route_count);
+        *size = 0;
+        return;
     }
 
     *size = (uint32_t)net_serializer_position(&s);
@@ -740,7 +748,7 @@ void mp_trade_sync_deserialize_routes(const uint8_t *buffer, uint32_t size)
 void mp_trade_sync_serialize_traders(uint8_t *buffer, uint32_t *size)
 {
     net_serializer s;
-    net_serializer_init(&s, buffer, 8192);
+    net_serializer_init(&s, buffer, NET_MAX_PAYLOAD_SIZE);
 
     uint16_t count = 0;
     for (int i = 0; i < MAX_REPLICATED_TRADERS; i++) {
@@ -763,6 +771,12 @@ void mp_trade_sync_serialize_traders(uint8_t *buffer, uint32_t *size)
         net_write_u32(&s, t->state_version);
         net_write_i32(&s, t->last_resource);
         net_write_i32(&s, t->last_amount);
+    }
+
+    if (net_serializer_has_overflow(&s)) {
+        log_error("Trade trader serialization overflow", 0, count);
+        *size = 0;
+        return;
     }
 
     *size = (uint32_t)net_serializer_position(&s);

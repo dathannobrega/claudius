@@ -852,9 +852,89 @@ static void trade_route_edge_list_add_edge(trade_route_edge_list *route_list, in
     }
 }
 
+static uint32_t legacy_route_visual_key(int route_id)
+{
+    return route_id > 0 ? (uint32_t)route_id : 0;
+}
+
 #ifdef ENABLE_MULTIPLAYER
+static uint32_t multiplayer_route_visual_key(const mp_trade_route_instance *route)
+{
+    uint32_t base_id;
+
+    if (!route) {
+        return 0;
+    }
+
+    base_id = route->network_route_id ? route->network_route_id : route->instance_id;
+    if (!base_id) {
+        return 0;
+    }
+
+    return 0x80000000u | (base_id & 0x7fffffffu);
+}
+
+static void add_trade_route_segment(trade_route_edge_list *route_list,
+                                    int x1, int y1, int x2, int y2,
+                                    int route_id, int is_sea)
+{
+    int edge_index;
+
+    if (!route_list) {
+        return;
+    }
+
+    edge_index = add_or_get_trade_edge(x1, y1, x2, y2, route_id, is_sea);
+    trade_route_edge_list_add_edge(route_list, edge_index);
+}
+
+static void add_multiplayer_trade_route_polyline(trade_route_edge_list *route_list,
+                                                 uint32_t route_key,
+                                                 int x1, int y1,
+                                                 int x2, int y2,
+                                                 int route_id,
+                                                 int is_sea)
+{
+    int dx = x2 - x1;
+    int dy = y2 - y1;
+    int distance_sq = dx * dx + dy * dy;
+    int distance;
+    int bend_sign;
+    int bend_offset;
+    int mid_x;
+    int mid_y;
+
+    if (distance_sq <= (24 * 24)) {
+        add_trade_route_segment(route_list, x1, y1, x2, y2, route_id, is_sea);
+        return;
+    }
+
+    distance = (int)sqrt((double)distance_sq);
+    if (distance <= 0) {
+        distance = 1;
+    }
+
+    bend_sign = ((route_key ^ (route_key >> 7)) & 1u) ? 1 : -1;
+    bend_offset = is_sea ? 34 : 22;
+    if (distance / 4 > bend_offset) {
+        bend_offset = distance / 4;
+    }
+    if (bend_offset > 56) {
+        bend_offset = 56;
+    }
+
+    mid_x = (x1 + x2) / 2 + bend_sign * ((-dy * bend_offset) / distance);
+    mid_y = (y1 + y2) / 2 + bend_sign * (( dx * bend_offset) / distance);
+
+    add_trade_route_segment(route_list, x1, y1, mid_x, mid_y, route_id, is_sea);
+    add_trade_route_segment(route_list, mid_x, mid_y, x2, y2, route_id, is_sea);
+}
+
 static int collect_multiplayer_trade_route_edge(mp_trade_route_instance *route, void *userdata)
 {
+    uint32_t route_key;
+    trade_route_edge_list *route_list;
+
     (void)userdata;
 
     if (!route || !route->is_player_to_player ||
@@ -874,18 +954,20 @@ static int collect_multiplayer_trade_route_edge(mp_trade_route_instance *route, 
         return 0;
     }
 
-    uint32_t route_key = route->network_route_id ? route->network_route_id : route->instance_id;
-    trade_route_edge_list *route_list = ensure_trade_route_edge_list(
+    route_key = multiplayer_route_visual_key(route);
+    route_list = ensure_trade_route_edge_list(
         route_key, route->transport == MP_TROUTE_SEA);
     if (!route_list) {
         return 0;
     }
 
-    int edge_index = add_or_get_trade_edge(
+    add_multiplayer_trade_route_polyline(
+        route_list,
+        route_key,
         origin_object->x + 25, origin_object->y + 25,
         dest_object->x + 25, dest_object->y + 25,
-        route->claudius_route_id, route->transport == MP_TROUTE_SEA);
-    trade_route_edge_list_add_edge(route_list, edge_index);
+        route->claudius_route_id,
+        route->transport == MP_TROUTE_SEA);
     return 0;
 }
 #endif
@@ -914,7 +996,7 @@ void window_empire_collect_trade_edges(void)
         int route_id = route_object->trade_route_id;
         const empire_object *trade_city_object = empire_object_get_trade_city(route_id);
         trade_route_edge_list *route_list =
-            ensure_trade_route_edge_list((uint32_t)route_id, is_sea_route);
+            ensure_trade_route_edge_list(legacy_route_visual_key(route_id), is_sea_route);
         if (!trade_city_object || !route_list || !our_city_object) {
             continue;
         }
@@ -996,7 +1078,7 @@ void window_empire_draw_static_trade_waypoints(const empire_object *route_object
         return;
     }
     int is_sea_route = route_object->type == EMPIRE_OBJECT_SEA_TRADE_ROUTE;
-    window_empire_draw_static_trade_route_by_id((uint32_t)route_object->trade_route_id,
+    window_empire_draw_static_trade_route_by_id(legacy_route_visual_key(route_object->trade_route_id),
                                                 is_sea_route, x_offset, y_offset, 1);
 }
 
@@ -1415,7 +1497,8 @@ static void draw_sidebar_city_item(const grid_box_item *item)
         // Everything fits
         image_draw(badge_id, x_offset + badge_margin, y_offset + badge_margin, COLOR_MASK_NONE, SCALE_NONE);
 
-        text_draw(name, x_offset + badge_margin + BLOCK_SIZE, y_offset + 9, FONT_LARGE_BLACK, 0);
+        text_draw_ellipsized(name, x_offset + badge_margin + BLOCK_SIZE, y_offset + 9,
+            item_usable_width - badge_width - 44, FONT_LARGE_BLACK, 0);
         if (city->is_open || draw_icon_on_top) {
             //if city is open, draw trade route icon to remind of type, same if it doesnt fit in the button
             int trade_route_icon_offset = badge_width + BLOCK_SIZE;
@@ -1428,7 +1511,8 @@ static void draw_sidebar_city_item(const grid_box_item *item)
     } else if (badge_width <= available_width) {
         // Only badge fits, check if the icon fits inside it
         image_draw(badge_id, x_offset + badge_margin, y_offset + badge_margin, COLOR_MASK_NONE, SCALE_NONE);
-        int city_name_end = text_draw(name, x_offset + badge_margin + BLOCK_SIZE, y_offset + 9, FONT_LARGE_BLACK, 0);
+        int city_name_end = text_draw_ellipsized(name, x_offset + badge_margin + BLOCK_SIZE, y_offset + 9,
+            badge_width - BLOCK_SIZE - 8, FONT_LARGE_BLACK, 0);
         int icon_fits_in_badge = (city_name_end + badge_margin + 2 + 34) <= (x_offset + badge_margin + badge_width);
         if (icon_fits_in_badge) {
             image_draw(image_id, x_offset + badge_margin + city_name_end + BLOCK_SIZE + 2,
@@ -1436,7 +1520,8 @@ static void draw_sidebar_city_item(const grid_box_item *item)
         }
 
     } else { // Not enough room for badge + icon
-        text_draw(name, x_offset + badge_margin, y_offset + 9, FONT_LARGE_BLACK, 0);
+        text_draw_ellipsized(name, x_offset + badge_margin, y_offset + 9,
+            item_usable_width - badge_margin - 8, FONT_LARGE_BLACK, 0);
     }
 #ifdef ENABLE_MULTIPLAYER
     /* Draw multiplayer owner tag in sidebar */
@@ -1448,18 +1533,31 @@ static void draw_sidebar_city_item(const grid_box_item *item)
 
         if (owner && owner->active) {
             /* "[PlayerName]" */
-            char tag_str[48];
-            snprintf(tag_str, sizeof(tag_str), "[%s]", owner->name);
-            uint8_t tag_buf[48];
-            string_copy(string_from_ascii(tag_str), tag_buf, 48);
+            char tag_str[64];
+            uint8_t tag_buf[64];
             font_t tag_font = mp_ownership_is_city_local(entry->city_id)
                 ? FONT_NORMAL_GREEN : FONT_NORMAL_WHITE;
-            int tag_w = text_draw(tag_buf, tag_x, tag_y, tag_font, 0);
+            int state_x = x_offset + item_usable_width - 68;
+            int tag_width = state_x - tag_x - 10;
+            int tag_end = tag_x;
+
+            snprintf(tag_str, sizeof(tag_str), "[%s]",
+                mp_player_registry_display_name(owner));
+            string_copy(string_from_ascii(tag_str), tag_buf, sizeof(tag_buf));
+            if (tag_width > 0) {
+                tag_end = text_draw_ellipsized(tag_buf, tag_x, tag_y, tag_width, tag_font, 0);
+            }
 
             /* Online/Offline dot */
             int is_online = mp_ownership_is_city_online(entry->city_id);
             color_t dot_color = is_online ? COLOR_MASK_GREEN : COLOR_MASK_RED;
-            graphics_fill_rect(tag_x + tag_w + 4, tag_y + 4, 6, 6, dot_color);
+            if (tag_width > 12) {
+                int dot_x = tag_end + 2;
+                if (dot_x > state_x - 8) {
+                    dot_x = state_x - 8;
+                }
+                graphics_fill_rect(dot_x, tag_y + 4, 6, 6, dot_color);
+            }
         }
 
         /* Route state */
@@ -1474,8 +1572,8 @@ static void draw_sidebar_city_item(const grid_box_item *item)
                 case MP_ROUTE_STATE_OFFLINE:  rkey = TR_MP_EMPIRE_ROUTE_OFFLINE;  rfont = FONT_NORMAL_RED;   break;
                 default:                      rkey = TR_MP_EMPIRE_ROUTE_ACTIVE;   rfont = FONT_NORMAL_PLAIN; break;
             }
-            int state_x = x_offset + item_usable_width - 60;
-            text_draw(translation_for(rkey), state_x, tag_y, rfont, 0);
+            int state_x = x_offset + item_usable_width - 68;
+            text_draw_ellipsized(translation_for(rkey), state_x, tag_y, 64, rfont, 0);
         }
     }
 #endif
@@ -1573,10 +1671,11 @@ static void draw_city_info(const empire_object *object)
 
         if (owner && owner->active) {
             uint8_t name_buf[64];
-            string_copy(string_from_ascii(owner->name), name_buf, 64);
+            string_copy(string_from_ascii(mp_player_registry_display_name(owner)), name_buf, 64);
             font_t name_font = mp_ownership_is_city_local(data.selected_city)
                 ? FONT_NORMAL_GREEN : FONT_NORMAL_WHITE;
-            text_draw(name_buf, mp_x - 100 + label_width + 4, mp_y, name_font, 0);
+            text_draw_ellipsized(name_buf, mp_x - 100 + label_width + 4, mp_y,
+                92, name_font, 0);
         }
 
         /* Online/Offline status */
@@ -1944,8 +2043,9 @@ static void draw_empire_object(const empire_object *obj)
 
             /* Draw player initial on top */
             mp_player *owner = mp_player_registry_get(owner_pid);
-            if (owner && owner->active && owner->name[0]) {
-                char initial[2] = { owner->name[0], '\0' };
+            const char *display_name = mp_player_registry_display_name(owner);
+            if (owner && owner->active && display_name[0]) {
+                char initial[2] = { display_name[0], '\0' };
                 uint8_t initial_buf[4];
                 string_copy(string_from_ascii(initial), initial_buf, 4);
                 text_draw(initial_buf, badge_x + 1, badge_y - 1, FONT_SMALL_PLAIN, 0);
@@ -1997,7 +2097,7 @@ static int draw_multiplayer_trade_route(mp_trade_route_instance *route, void *us
 
     int route_state = mp_ownership_get_route_state(route->claudius_route_id);
     int animate_pulses = (route_state == MP_ROUTE_STATE_ACTIVE);
-    route_key = route->network_route_id ? route->network_route_id : route->instance_id;
+    route_key = multiplayer_route_visual_key(route);
     window_empire_draw_static_trade_route_by_id(
         route_key,
         route->transport == MP_TROUTE_SEA,
@@ -2114,26 +2214,27 @@ static void draw_city_name(const empire_city *city)
             } else {
                 uint8_t owner_pid = mp_ownership_get_city_player_id(data.selected_city);
                 mp_player *owner = mp_player_registry_get(owner_pid);
-                if (owner && owner->active && owner->name[0]) {
+                const char *owner_name = mp_player_registry_display_name(owner);
+                if (owner && owner->active && owner_name[0]) {
                     /* "City of PlayerName" */
-                    uint8_t display_name[128];
+                    uint8_t display_buf[128];
                     const uint8_t *prefix = translation_for(TR_MP_EMPIRE_CITY_OF);
-                    uint8_t *end = string_copy(prefix, display_name, 128);
-                    int remaining = 128 - (int)(end - display_name);
+                    uint8_t *end = string_copy(prefix, display_buf, 128);
+                    int remaining = 128 - (int)(end - display_buf);
                     if (remaining > 1) {
-                        string_copy(string_from_ascii(owner->name), end, remaining);
+                        string_copy(string_from_ascii(mp_player_registry_display_name(owner)), end, remaining);
                     }
-                    text_draw_centered(display_name, x_offset, y_offset, 268, FONT_LARGE_BLACK, 0);
+                    text_draw_centered_ellipsized(display_buf, x_offset, y_offset, 268, FONT_LARGE_BLACK, 0);
                 } else {
                     const uint8_t *city_name = empire_city_get_name(city);
-                    text_draw_centered(city_name, x_offset, y_offset, 268, FONT_LARGE_BLACK, 0);
+                    text_draw_centered_ellipsized(city_name, x_offset, y_offset, 268, FONT_LARGE_BLACK, 0);
                 }
             }
         } else
 #endif
         {
             const uint8_t *city_name = empire_city_get_name(city);
-            text_draw_centered(city_name, x_offset, y_offset, 268, FONT_LARGE_BLACK, 0);
+            text_draw_centered_ellipsized(city_name, x_offset, y_offset, 268, FONT_LARGE_BLACK, 0);
         }
     }
 }

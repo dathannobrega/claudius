@@ -99,8 +99,8 @@ static void draw_player_item(const list_box_item *item)
 
     /* Player name */
     uint8_t name_buf[64];
-    string_copy(string_from_ascii(player->name), name_buf, 64);
-    text_draw(name_buf, item->x + 8, item->y + 4, name_font, 0);
+    string_copy(string_from_ascii(mp_player_registry_display_name(player)), name_buf, 64);
+    text_draw_ellipsized(name_buf, item->x + 8, item->y + 4, 164, name_font, 0);
 
     /* Host indicator */
     if (player->is_host) {
@@ -111,13 +111,16 @@ static void draw_player_item(const list_box_item *item)
     /* Reconnection status */
     if (player->status == MP_PLAYER_IN_GAME || player->connection_state == MP_CONNECTION_CONNECTED) {
         const uint8_t *status_text = translation_for(TR_MP_RESUME_RECONNECTED);
-        text_draw(status_text, item->x + 240, item->y + 4, FONT_NORMAL_GREEN, 0);
+        text_draw_ellipsized(status_text, item->x + 240, item->y + 4,
+            item->width - 248, FONT_NORMAL_GREEN, 0);
     } else if (player->status == MP_PLAYER_AWAITING_RECONNECT) {
         const uint8_t *status_text = translation_for(TR_MP_RESUME_AWAITING);
-        text_draw(status_text, item->x + 240, item->y + 4, FONT_NORMAL_PLAIN, 0);
+        text_draw_ellipsized(status_text, item->x + 240, item->y + 4,
+            item->width - 248, FONT_NORMAL_PLAIN, 0);
     } else {
         const uint8_t *status_text = translation_for(TR_MP_RESUME_WILL_BE_OFFLINE);
-        text_draw(status_text, item->x + 240, item->y + 4, FONT_NORMAL_RED, 0);
+        text_draw_ellipsized(status_text, item->x + 240, item->y + 4,
+            item->width - 248, FONT_NORMAL_RED, 0);
     }
 
     if (item->is_focused) {
@@ -158,13 +161,14 @@ static void draw_background(void)
     {
         const char *scenario = mp_bootstrap_get_scenario_name();
         if (!scenario || !scenario[0]) {
-            scenario = "Unknown";
+            scenario = (const char *)translation_for(TR_MP_RESUME_UNKNOWN);
         }
-        char info_str[128];
-        snprintf(info_str, sizeof(info_str), "Save: %s", scenario);
-        uint8_t info_buf[128];
-        string_copy(string_from_ascii(info_str), info_buf, 128);
-        text_draw_centered(info_buf, PANEL_X, PANEL_Y + 42,
+        char info_str[160];
+        snprintf(info_str, sizeof(info_str), "%s%s",
+            (const char *)translation_for(TR_MP_RESUME_SAVE_LABEL), scenario);
+        uint8_t info_buf[160];
+        string_copy(string_from_ascii(info_str), info_buf, 160);
+        text_draw_centered_ellipsized(info_buf, PANEL_X, PANEL_Y + 42,
             PANEL_WIDTH_BLOCKS * 16, FONT_NORMAL_BLACK, 0);
     }
 

@@ -173,9 +173,11 @@ static void init(int remote_city_id)
     uint8_t owner_pid = mp_ownership_get_city_player_id(remote_city_id);
     mp_player *owner = mp_player_registry_get(owner_pid);
     if (owner && owner->active) {
-        snprintf(data.owner_name, sizeof(data.owner_name), "%s", owner->name);
+        snprintf(data.owner_name, sizeof(data.owner_name), "%s",
+            mp_player_registry_display_name(owner));
     } else {
-        snprintf(data.owner_name, sizeof(data.owner_name), "???");
+        snprintf(data.owner_name, sizeof(data.owner_name), "%s",
+            (const char *)translation_for(TR_MP_RESUME_UNKNOWN));
     }
 
     data.local_city_id = find_local_player_city();
@@ -271,7 +273,7 @@ static void draw_foreground(void)
         int len = string_length(title_prefix);
         string_copy(title_prefix, title_buf, 80);
         string_copy(name_buf, title_buf + len, 80 - len);
-        text_draw_centered(title_buf, cx, cy + 12, DIALOG_W, FONT_LARGE_BLACK, 0);
+        text_draw_centered_ellipsized(title_buf, cx, cy + 12, DIALOG_W, FONT_LARGE_BLACK, 0);
     }
 
     /* ---- Online/Offline status ---- */

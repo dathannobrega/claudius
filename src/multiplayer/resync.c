@@ -3,6 +3,7 @@
 #ifdef ENABLE_MULTIPLAYER
 
 #include "snapshot.h"
+#include "time_sync.h"
 #include "network/session.h"
 #include "network/protocol.h"
 #include "core/log.h"
@@ -31,6 +32,7 @@ void mp_resync_request_full_snapshot(void)
 
     resync_data.in_progress = 1;
     resync_data.attempt_count++;
+    mp_time_sync_set_join_barrier(1);
 
     log_info("Requesting full resync from host", 0, resync_data.attempt_count);
 
@@ -74,10 +76,12 @@ void multiplayer_resync_apply_full_snapshot(const uint8_t *data, uint32_t size)
 
     if (mp_snapshot_apply_full(data, size)) {
         resync_data.in_progress = 0;
+        mp_time_sync_set_join_barrier(0);
         log_info("Resync completed successfully", 0, 0);
     } else {
         log_error("Resync snapshot application failed", 0, 0);
         resync_data.in_progress = 0;
+        mp_time_sync_set_join_barrier(0);
     }
 }
 

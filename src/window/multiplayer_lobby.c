@@ -57,9 +57,6 @@ static void on_return(window_id from);
 static generic_button host_buttons[3];
 static generic_button client_buttons[2];
 
-static const uint8_t status_awaiting_text[] = "Awaiting Reconnect";
-static const uint8_t status_desynced_text[] = "Desynced";
-
 static list_box_type player_list = {
     .x = LIST_X,
     .y = LIST_Y,
@@ -132,9 +129,9 @@ static const uint8_t *status_text(const mp_player *player)
         case MP_PLAYER_DISCONNECTED:
             return translation_for(TR_MP_LOBBY_DISCONNECTED);
         case MP_PLAYER_AWAITING_RECONNECT:
-            return status_awaiting_text;
+            return translation_for(TR_MP_LOBBY_AWAITING_RECONNECT);
         case MP_PLAYER_DESYNCED:
-            return status_desynced_text;
+            return translation_for(TR_MP_STATUS_DESYNCED);
         case MP_PLAYER_LOBBY:
         default:
             if (player->connection_state == MP_CONNECTION_DISCONNECTED) {
@@ -189,7 +186,7 @@ static void draw_player_item(const list_box_item *item)
     {
         font_t name_font = item->is_focused ? FONT_NORMAL_WHITE : FONT_NORMAL_GREEN;
         uint8_t name_buf[64];
-        string_copy(string_from_ascii(player->name), name_buf, sizeof(name_buf));
+        string_copy(string_from_ascii(mp_player_registry_display_name(player)), name_buf, sizeof(name_buf));
         text_ellipsize(name_buf, name_font, HOST_COLUMN_X - NAME_COLUMN_X - 12);
         text_draw(name_buf, NAME_COLUMN_X, item->y + 4, name_font, 0);
     }
@@ -201,7 +198,8 @@ static void draw_player_item(const list_box_item *item)
 
     {
         const uint8_t *player_status = status_text(player);
-        text_draw(player_status, STATUS_COLUMN_X, item->y + 4, status_font(player), 0);
+        text_draw_ellipsized(player_status, STATUS_COLUMN_X, item->y + 4,
+            PING_COLUMN_X - STATUS_COLUMN_X - 8, status_font(player), 0);
     }
 
     if (!player->is_local) {

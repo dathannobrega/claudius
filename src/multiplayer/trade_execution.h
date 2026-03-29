@@ -98,6 +98,26 @@ mp_trade_exec_result mp_trade_commit_transaction(uint32_t route_instance_id,
                                                    int figure_id);
 
 /**
+ * Execute a single-sided storage mutation for an in-flight trader.
+ * This is the authoritative path used by caravan/docker gameplay code in
+ * multiplayer so storage, route counters and replication all stay aligned.
+ *
+ * buying=1  => trader buys from the building (player exports)
+ * buying=0  => trader sells into the building (player imports)
+ *
+ * trader_type matches the legacy Claudius storage helpers:
+ *   0 = sea trader
+ *   1 = land trader
+ */
+mp_trade_exec_result mp_trade_execute_storage_trade(int route_id,
+                                                    int resource,
+                                                    int amount,
+                                                    int building_id,
+                                                    int buying,
+                                                    int trader_type,
+                                                    int figure_id);
+
+/**
  * Process all eligible routes for the current tick.
  * Called once per tick on the host.
  * Routes are processed in deterministic order (by instance_id).

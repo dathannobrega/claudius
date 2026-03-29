@@ -22,6 +22,7 @@
 #include "core/log.h"
 
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -57,10 +58,47 @@ static struct {
     int unread;
 } chat_history;
 
+static int fill_session_random_bytes(uint8_t *out, size_t size)
+{
+    size_t offset = 0;
+
+    if (!out || size == 0) {
+        return 0;
+    }
+#if defined(_WIN32) && defined(_MSC_VER)
+    while (offset < size) {
+        unsigned int value = 0;
+        size_t chunk = size - offset;
+        if (chunk > sizeof(value)) {
+            chunk = sizeof(value);
+        }
+        if (rand_s(&value) != 0) {
+            break;
+        }
+        memcpy(out + offset, &value, chunk);
+        offset += chunk;
+    }
+#else
+    {
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f) {
+            offset = fread(out, 1, size, f);
+            fclose(f);
+        }
+    }
+#endif
+    return offset == size;
+}
+
 static uint32_t generate_session_id(void)
 {
+    uint32_t value = 0;
+    if (fill_session_random_bytes((uint8_t *)&value, sizeof(value))) {
+        return value ? value : 1u;
+    }
     srand((unsigned int)time(NULL));
-    return (uint32_t)rand() ^ ((uint32_t)rand() << 16);
+    value = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
+    return value ? value : 1u;
 }
 
 static int uuid_is_nonzero(const uint8_t *uuid, size_t size)

@@ -71,6 +71,7 @@ typedef struct {
     uint32_t commands_sent;
     uint32_t commands_rejected;
     uint32_t resyncs_requested;
+    uint32_t last_command_sequence_accepted;
 } mp_player;
 
 void mp_player_registry_init(void);
@@ -93,6 +94,7 @@ mp_player *mp_player_registry_get_by_uuid(const uint8_t *uuid);
 mp_player *mp_player_registry_get_by_slot(uint8_t slot_id);
 int mp_player_registry_get_count(void);
 void mp_player_registry_mark_local_player(uint8_t player_id);
+const char *mp_player_registry_display_name(const mp_player *player);
 
 /* Setters */
 void mp_player_registry_set_status(uint8_t player_id, mp_player_status status);

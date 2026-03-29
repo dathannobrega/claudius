@@ -22,7 +22,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define DOMAIN_BUFFER_SIZE 32768
+#define DOMAIN_BUFFER_SIZE MP_SAVE_MAX_DOMAIN_SIZE
 
 /* v2 header wire size = 58 bytes, v3 = 62 bytes, v4 = 73 bytes, v5 = 93 bytes, v6 = 97 bytes */
 #define HEADER_V2_SIZE 58
@@ -241,6 +241,11 @@ int mp_session_load_from_buffer(const uint8_t *buffer, uint32_t size)
     mp_save_header header;
     if (!mp_session_save_read_header(buffer, size, &header)) {
         log_error("Failed to read multiplayer save header", 0, 0);
+        return 0;
+    }
+
+    if (header.version < MP_SAVE_VERSION) {
+        log_error("Multiplayer save version too old for this build", 0, (int)header.version);
         return 0;
     }
 

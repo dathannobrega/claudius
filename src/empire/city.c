@@ -377,6 +377,8 @@ typedef struct {
     int has_any_route;
     int preferred_route_id;
     int fallback_route_id;
+    int preferred_network_route_id;
+    int fallback_network_route_id;
 } mp_city_route_binding_refresh;
 
 static int collect_primary_mp_route_for_city(mp_trade_route_instance *route, void *userdata)
@@ -393,11 +395,13 @@ static int collect_primary_mp_route_for_city(mp_trade_route_instance *route, voi
     refresh->has_any_route = 1;
     if (!refresh->fallback_route_id || route->claudius_route_id < refresh->fallback_route_id) {
         refresh->fallback_route_id = route->claudius_route_id;
+        refresh->fallback_network_route_id = (int)route->network_route_id;
     }
 
     if (route->status == MP_TROUTE_ACTIVE &&
         (!refresh->preferred_route_id || route->claudius_route_id < refresh->preferred_route_id)) {
         refresh->preferred_route_id = route->claudius_route_id;
+        refresh->preferred_network_route_id = (int)route->network_route_id;
     }
 
     return 0;
@@ -422,6 +426,13 @@ void empire_city_refresh_trade_route_bindings(int city_id)
         ? refresh.preferred_route_id
         : refresh.fallback_route_id;
     city->is_open = refresh.has_any_route ? 1 : 0;
+    if (city->route_id > 0) {
+        trade_route_set_network_id(
+            city->route_id,
+            refresh.preferred_route_id > 0
+                ? refresh.preferred_network_route_id
+                : refresh.fallback_network_route_id);
+    }
 #else
     (void)city_id;
 #endif

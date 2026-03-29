@@ -147,34 +147,158 @@ mp_trade_exec_result mp_trade_validate_import(uint32_t route_instance_id,
     return MP_TRADE_OK;
 }
 
-/* ---- Emit transaction event ---- */
-
-static void emit_transaction_event(const mp_trade_transaction *tx)
+static void finalize_last_transaction(const mp_trade_route_instance *route,
+                                      int resource,
+                                      int amount_requested,
+                                      int amount_committed,
+                                      int source_storage_id,
+                                      int dest_storage_id,
+                                      int figure_id,
+                                      mp_trade_exec_result result)
 {
-    if (!net_session_is_host()) {
-        return;
+    mp_trade_transaction tx;
+
+    memset(&tx, 0, sizeof(tx));
+    tx.transaction_id = exec_data.next_transaction_id++;
+    tx.route_instance_id = route ? route->instance_id : 0;
+    tx.origin_player_id = route ? route->origin_player_id : 0;
+    tx.origin_city_id = route ? route->origin_city_id : -1;
+    tx.dest_player_id = route ? route->dest_player_id : 0xFF;
+    tx.dest_city_id = route ? route->dest_city_id : -1;
+    tx.resource = resource;
+    tx.amount_requested = amount_requested;
+    tx.amount_committed = amount_committed;
+    tx.source_storage_id = source_storage_id;
+    tx.dest_storage_id = dest_storage_id;
+    tx.tick = net_session_get_authoritative_tick();
+    tx.transport_type = (route && route->transport == MP_TROUTE_SEA) ? 1 : 0;
+    tx.figure_id = figure_id;
+    tx.result = result;
+
+    exec_data.last_transaction = tx;
+    if (result == MP_TRADE_OK) {
+        exec_data.total_transactions++;
     }
 
-    uint8_t buf[96];
-    net_serializer s;
-    net_serializer_init(&s, buf, sizeof(buf));
+    if (route && result == MP_TRADE_OK) {
+        mp_trade_log_entry log_entry;
+        memset(&log_entry, 0, sizeof(log_entry));
+        log_entry.tick = tx.tick;
+        log_entry.route_instance_id = route->instance_id;
+        log_entry.origin_player_id = route->origin_player_id;
+        log_entry.origin_city_id = route->origin_city_id;
+        log_entry.dest_player_id = route->dest_player_id;
+        log_entry.dest_city_id = route->dest_city_id;
+        log_entry.resource = resource;
+        log_entry.amount_requested = amount_requested;
+        log_entry.amount_committed = amount_committed;
+        log_entry.source_storage_id = source_storage_id;
+        log_entry.dest_storage_id = dest_storage_id;
+        log_entry.figure_id = figure_id;
+        log_entry.export_quota_after = route->resources[resource].exported_this_year;
+        log_entry.import_quota_after = route->resources[resource].imported_this_year;
+        log_entry.outcome = MP_TLOG_SUCCESS;
+        mp_trade_log_record(&log_entry);
+    }
+}
 
-    net_write_u16(&s, NET_EVENT_TRADER_TRADE_EXECUTED);
-    net_write_u32(&s, tx->tick);
-    net_write_u32(&s, tx->transaction_id);
-    net_write_u32(&s, tx->route_instance_id);
-    net_write_u8(&s, tx->origin_player_id);
-    net_write_i32(&s, tx->origin_city_id);
-    net_write_u8(&s, tx->dest_player_id);
-    net_write_i32(&s, tx->dest_city_id);
-    net_write_i32(&s, tx->resource);
-    net_write_i32(&s, tx->amount_committed);
-    net_write_i32(&s, tx->source_storage_id);
-    net_write_i32(&s, tx->dest_storage_id);
-    net_write_u8(&s, tx->transport_type);
-    net_write_i32(&s, tx->figure_id);
+static mp_trade_route_instance *resolve_trade_route_for_execution(int route_id)
+{
+    uint32_t network_route_id = 0;
 
-    net_session_broadcast(NET_MSG_HOST_EVENT, buf, (uint32_t)net_serializer_position(&s));
+    if (route_id < 0) {
+        return 0;
+    }
+
+    network_route_id = (uint32_t)trade_route_get_network_id(route_id);
+    if (network_route_id == 0) {
+        network_route_id = mp_ownership_get_network_route_id(route_id);
+    }
+
+    return mp_trade_route_resolve(route_id, network_route_id);
+}
+
+mp_trade_exec_result mp_trade_execute_storage_trade(int route_id,
+                                                    int resource,
+                                                    int amount,
+                                                    int building_id,
+                                                    int buying,
+                                                    int trader_type,
+                                                    int figure_id)
+{
+    mp_trade_route_instance *route;
+    mp_trade_exec_result validation;
+    building *b;
+    int committed = 0;
+
+    if (!net_session_is_active() || !net_session_is_host()) {
+        return MP_TRADE_ERR_INTERNAL;
+    }
+    if (amount <= 0) {
+        return MP_TRADE_ERR_INTERNAL;
+    }
+
+    route = resolve_trade_route_for_execution(route_id);
+    if (!route) {
+        MP_LOG_WARN("TRADE_EXEC", "Could not resolve authoritative route for route_id=%d", route_id);
+        return MP_TRADE_ERR_ROUTE_INVALID;
+    }
+    if (route->status != MP_TROUTE_ACTIVE) {
+        return MP_TRADE_ERR_ROUTE_INACTIVE;
+    }
+
+    validation = buying
+        ? mp_trade_validate_export(route->instance_id, resource, amount, building_id)
+        : mp_trade_validate_import(route->instance_id, resource, amount, building_id);
+    if (validation != MP_TRADE_OK) {
+        return validation;
+    }
+
+    b = building_get(building_id);
+    if (!b || b->state != BUILDING_STATE_IN_USE) {
+        return MP_TRADE_ERR_STORAGE_NOT_FOUND;
+    }
+
+    if (buying) {
+        if (b->type == BUILDING_GRANARY) {
+            committed = building_granary_remove_export(b, resource, amount, trader_type);
+        } else if (b->type == BUILDING_WAREHOUSE) {
+            committed = building_warehouse_remove_export(b, resource, amount, trader_type);
+        }
+        if (committed <= 0) {
+            return MP_TRADE_ERR_NO_STOCK;
+        }
+        mp_trade_route_record_export(route->instance_id, resource, committed);
+        if (route->claudius_route_id >= 0 && trade_route_is_valid(route->claudius_route_id)) {
+            for (int i = 0; i < committed; i++) {
+                trade_route_increase_traded(route->claudius_route_id, resource, 1);
+            }
+        }
+        route->last_trade_tick = net_session_get_authoritative_tick();
+        finalize_last_transaction(route, resource, amount, committed,
+                                  building_id, 0, figure_id, MP_TRADE_OK);
+    } else {
+        if (b->type == BUILDING_GRANARY) {
+            committed = building_granary_add_import(b, resource, amount, trader_type);
+        } else if (b->type == BUILDING_WAREHOUSE) {
+            committed = building_warehouse_add_import(b, resource, amount, trader_type);
+        }
+        if (committed <= 0) {
+            return MP_TRADE_ERR_NO_CAPACITY;
+        }
+        mp_trade_route_record_import(route->instance_id, resource, committed);
+        if (route->claudius_route_id >= 0 && trade_route_is_valid(route->claudius_route_id)) {
+            for (int i = 0; i < committed; i++) {
+                trade_route_increase_traded(route->claudius_route_id, resource, 0);
+            }
+        }
+        route->last_trade_tick = net_session_get_authoritative_tick();
+        finalize_last_transaction(route, resource, amount, committed,
+                                  0, building_id, figure_id, MP_TRADE_OK);
+    }
+
+    mp_trade_sync_emit_trader_trade_executed(figure_id, resource, committed, buying, building_id);
+    return MP_TRADE_OK;
 }
 
 /* ---- Atomic Commit ---- */
@@ -321,52 +445,10 @@ mp_trade_exec_result mp_trade_commit_transaction(uint32_t route_instance_id,
 
     route->last_trade_tick = net_session_get_authoritative_tick();
 
-    /* 6. Build transaction record */
-    mp_trade_transaction tx;
-    memset(&tx, 0, sizeof(tx));
-    tx.transaction_id = exec_data.next_transaction_id++;
-    tx.route_instance_id = route_instance_id;
-    tx.origin_player_id = route->origin_player_id;
-    tx.origin_city_id = route->origin_city_id;
-    tx.dest_player_id = route->dest_player_id;
-    tx.dest_city_id = route->dest_city_id;
-    tx.resource = resource;
-    tx.amount_requested = amount;
-    tx.amount_committed = added;
-    tx.source_storage_id = source_building_id;
-    tx.dest_storage_id = dest_building_id;
-    tx.tick = net_session_get_authoritative_tick();
-    tx.transport_type = (route->transport == MP_TROUTE_SEA) ? 1 : 0;
-    tx.figure_id = figure_id;
-    tx.result = MP_TRADE_OK;
-
-    exec_data.last_transaction = tx;
-    exec_data.total_transactions++;
-
-    /* 7. Emit event to all clients */
-    emit_transaction_event(&tx);
-
-    /* 8. Structured audit log */
-    {
-        mp_trade_log_entry log_entry;
-        memset(&log_entry, 0, sizeof(log_entry));
-        log_entry.tick = tx.tick;
-        log_entry.route_instance_id = route_instance_id;
-        log_entry.origin_player_id = route->origin_player_id;
-        log_entry.origin_city_id = route->origin_city_id;
-        log_entry.dest_player_id = route->dest_player_id;
-        log_entry.dest_city_id = route->dest_city_id;
-        log_entry.resource = resource;
-        log_entry.amount_requested = amount;
-        log_entry.amount_committed = added;
-        log_entry.source_storage_id = source_building_id;
-        log_entry.dest_storage_id = dest_building_id;
-        log_entry.figure_id = figure_id;
-        log_entry.export_quota_after = route->resources[resource].exported_this_year;
-        log_entry.import_quota_after = route->resources[resource].imported_this_year;
-        log_entry.outcome = MP_TLOG_SUCCESS;
-        mp_trade_log_record(&log_entry);
-    }
+    /* 6. Record and emit the committed result */
+    finalize_last_transaction(route, resource, amount, added,
+                              source_building_id, dest_building_id,
+                              figure_id, MP_TRADE_OK);
 
     return MP_TRADE_OK;
 }

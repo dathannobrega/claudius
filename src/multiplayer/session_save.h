@@ -34,10 +34,13 @@
  *
  * v6 additions:
  *   - Dedicated P2P routes domain (mp_trade_route_instance table)
+ *
+ * v7 additions:
+ *   - Player registry persists last accepted command sequence for anti-replay resume
  */
 
 #define MP_SAVE_MAGIC       0x4D504C59  /* "MPLY" */
-#define MP_SAVE_VERSION     6
+#define MP_SAVE_VERSION     7
 #define MP_SAVE_DOMAIN_COUNT 8
 
 #define MP_SAVE_MAX_FILE_SIZE       (512 * 1024)
