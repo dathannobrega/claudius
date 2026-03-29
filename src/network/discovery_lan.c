@@ -314,11 +314,9 @@ static void process_announcement(const uint8_t *buf, size_t size, const net_udp_
     if (slot >= 0) {
         net_discovered_host *h = &data.hosts[slot];
         h->active = 1;
-        strncpy(h->host_name, host_name, sizeof(h->host_name) - 1);
-        h->host_name[sizeof(h->host_name) - 1] = '\0';
+        snprintf(h->host_name, sizeof(h->host_name), "%s", host_name);
         /* Store clean IP (no port suffix) from inet_ntop */
-        strncpy(h->host_ip, sender_ip, sizeof(h->host_ip) - 1);
-        h->host_ip[sizeof(h->host_ip) - 1] = '\0';
+        snprintf(h->host_ip, sizeof(h->host_ip), "%s", sender_ip);
         h->port = game_port;
         h->player_count = player_count;
         h->max_players = max_players;

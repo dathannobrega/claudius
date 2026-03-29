@@ -43,6 +43,8 @@ int mp_dedicated_server_is_enabled(void);
 const char *mp_dedicated_server_get_save_dir(void);
 const char *mp_dedicated_server_get_listen_address(void);
 int mp_dedicated_server_is_banned(const uint8_t *player_uuid, const char *remote_address);
+void mp_dedicated_server_request_shutdown(void);
+int mp_dedicated_server_consume_shutdown_request(void);
 
 #endif /* ENABLE_MULTIPLAYER */
 

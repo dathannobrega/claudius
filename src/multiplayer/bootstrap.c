@@ -94,9 +94,8 @@ void mp_bootstrap_set_scenario(const char *scenario_name)
     if (!scenario_name || !scenario_name[0]) {
         return;
     }
-    strncpy(boot_data.scenario_name, scenario_name,
-            MP_MANIFEST_SCENARIO_NAME_MAX - 1);
-    boot_data.scenario_name[MP_MANIFEST_SCENARIO_NAME_MAX - 1] = '\0';
+    snprintf(boot_data.scenario_name, sizeof(boot_data.scenario_name), "%s",
+             scenario_name);
     boot_data.state = MP_BOOT_SCENARIO_SELECTED;
 
     MP_LOG_INFO("BOOT", "Scenario selected: '%s'", boot_data.scenario_name);
@@ -462,8 +461,8 @@ int mp_bootstrap_client_prepare(const uint8_t *payload, uint32_t size)
     /* Check if this is a resume from save */
     if (manifest->mode == MP_GAME_MODE_SAVED_GAME) {
         MP_LOG_INFO("BOOT", "Client resume mode: waiting for save transfer from host");
-        strncpy(boot_data.save_filename, manifest->scenario_name,
-                MP_MANIFEST_SCENARIO_NAME_MAX - 1);
+        snprintf(boot_data.save_filename, sizeof(boot_data.save_filename), "%s",
+                 manifest->scenario_name);
         boot_data.is_resume = 1;
         boot_data.state = MP_BOOT_SAVE_TRANSFER;
 
@@ -486,8 +485,8 @@ int mp_bootstrap_client_prepare(const uint8_t *payload, uint32_t size)
     mp_worldgen_get_spawn_table_mutable()->session_seed = manifest->session_seed;
 
     /* 3. Copy scenario name to boot data */
-    strncpy(boot_data.scenario_name, manifest->scenario_name,
-            MP_MANIFEST_SCENARIO_NAME_MAX - 1);
+    snprintf(boot_data.scenario_name, sizeof(boot_data.scenario_name), "%s",
+             manifest->scenario_name);
     boot_data.state = MP_BOOT_PREPARING;
 
     /* 4. Load the scenario locally */
@@ -589,9 +588,8 @@ void mp_bootstrap_set_save(const char *save_filename)
     if (!save_filename || !save_filename[0]) {
         return;
     }
-    strncpy(boot_data.save_filename, save_filename,
-            MP_MANIFEST_SCENARIO_NAME_MAX - 1);
-    boot_data.save_filename[MP_MANIFEST_SCENARIO_NAME_MAX - 1] = '\0';
+    snprintf(boot_data.save_filename, sizeof(boot_data.save_filename), "%s",
+             save_filename);
     boot_data.is_resume = 1;
     boot_data.state = MP_BOOT_SAVE_SELECTED;
 
@@ -1150,8 +1148,8 @@ int mp_bootstrap_host_handle_late_join(uint8_t peer_index, const char *player_na
             net_session *sess = net_session_get();
             net_peer *mutable_peer = &sess->peers[peer_index];
 
-            strncpy(mutable_peer->name, player_name, NET_MAX_PLAYER_NAME - 1);
-            mutable_peer->name[NET_MAX_PLAYER_NAME - 1] = '\0';
+            snprintf(mutable_peer->name, sizeof(mutable_peer->name), "%s",
+                     player_name);
             net_peer_set_player_id(mutable_peer, (uint8_t)new_player_id);
             mutable_peer->state = PEER_STATE_LOADING;
 

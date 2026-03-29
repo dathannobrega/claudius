@@ -120,6 +120,14 @@ static int session_host_uses_player_slot(void)
     return !mp_dedicated_server_is_enabled();
 }
 
+static void copy_text(char *dst, size_t dst_size, const char *src)
+{
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    snprintf(dst, dst_size, "%s", src ? src : "");
+}
+
 static uint8_t first_assignable_player_id(void)
 {
     return session_host_uses_player_slot() ? 1 : 0;
@@ -219,8 +227,7 @@ static net_handshake_ip_state *find_or_alloc_handshake_state(const char *address
 
     memset(candidate, 0, sizeof(*candidate));
     candidate->in_use = 1;
-    strncpy(candidate->remote_address, address, sizeof(candidate->remote_address) - 1);
-    candidate->remote_address[sizeof(candidate->remote_address) - 1] = '\0';
+    copy_text(candidate->remote_address, sizeof(candidate->remote_address), address);
     return candidate;
 }
 
@@ -358,8 +365,8 @@ static void build_discovery_announcement(net_discovery_announcement *announcemen
     }
     memset(announcement, 0, sizeof(*announcement));
 
-    strncpy(announcement->host_name, session.local_player_name,
-            sizeof(announcement->host_name) - 1);
+    copy_text(announcement->host_name, sizeof(announcement->host_name),
+              session.local_player_name);
     announcement->game_port = session.port;
     if (mp_dedicated_server_is_enabled()) {
         const mp_dedicated_server_options *options = mp_dedicated_server_get_options();
@@ -469,8 +476,7 @@ static void handle_peer_disconnect(int peer_index)
     if (!peer->active) {
         return;
     }
-    strncpy(player_name, peer->name, sizeof(player_name) - 1);
-    player_name[sizeof(player_name) - 1] = '\0';
+    copy_text(player_name, sizeof(player_name), peer->name);
 
     /* Phase 7: Check for incomplete join transaction and roll back */
     {
@@ -716,8 +722,7 @@ static int try_reconnect_player(net_peer *peer, const uint8_t *uuid,
     }
 
     /* Update peer identity */
-    strncpy(peer->name, existing->name, NET_MAX_PLAYER_NAME - 1);
-    peer->name[NET_MAX_PLAYER_NAME - 1] = '\0';
+    copy_text(peer->name, sizeof(peer->name), existing->name);
     net_peer_set_player_id(peer, old_player_id);
     peer->state = PEER_STATE_JOINED;
 
@@ -779,8 +784,6 @@ static void handle_hello_impl(net_peer *peer, const uint8_t *payload, uint32_t s
     uint8_t requested_world_uuid[MP_WORLD_UUID_SIZE];
     uint32_t requested_resume_generation = 0;
     uint8_t current_world_uuid[MP_WORLD_UUID_SIZE];
-    uint8_t reject_buf[2];
-    net_serializer rs;
     int peer_index;
     int has_uuid;
     int reserved_slots;
@@ -848,13 +851,11 @@ static void handle_hello_impl(net_peer *peer, const uint8_t *payload, uint32_t s
             name[--len] = '\0';
         }
         if (len == 0) {
-            strncpy(name, "Unknown", NET_MAX_PLAYER_NAME - 1);
-            name[NET_MAX_PLAYER_NAME - 1] = '\0';
+            copy_text(name, sizeof(name), "Unknown");
         }
     }
 
-    strncpy(peer->name, name, NET_MAX_PLAYER_NAME - 1);
-    peer->name[NET_MAX_PLAYER_NAME - 1] = '\0';
+    copy_text(peer->name, sizeof(peer->name), name);
 
     MP_LOG_INFO("HANDSHAKE", "HELLO received: name='%s' magic=0x%08x version=%d "
                 "save_ver=%u map_hash=0x%08x scenario_hash=0x%08x flags=0x%08x "
@@ -927,8 +928,7 @@ static void handle_hello_impl(net_peer *peer, const uint8_t *payload, uint32_t s
         mp_player_registry_set_status(old_player_id, MP_PLAYER_LOBBY);
         mp_player_registry_set_connection_state(old_player_id, MP_CONNECTION_CONNECTED);
 
-        strncpy(peer->name, existing->name, NET_MAX_PLAYER_NAME - 1);
-        peer->name[NET_MAX_PLAYER_NAME - 1] = '\0';
+        copy_text(peer->name, sizeof(peer->name), existing->name);
         net_peer_set_player_id(peer, old_player_id);
         peer->state = PEER_STATE_JOINED;
 
@@ -1399,8 +1399,7 @@ static void handle_chat_from_client(net_peer *peer, const uint8_t *payload, uint
     /* Also store in host's chat history */
     mp_chat_entry *entry = &chat_history.entries[chat_history.write_index];
     entry->sender_id = peer->player_id;
-    strncpy(entry->message, message, MP_CHAT_MESSAGE_MAX - 1);
-    entry->message[MP_CHAT_MESSAGE_MAX - 1] = '\0';
+    copy_text(entry->message, sizeof(entry->message), message);
     entry->timestamp_tick = session.authoritative_tick;
     chat_history.write_index = (chat_history.write_index + 1) % MP_CHAT_HISTORY_SIZE;
     if (chat_history.count < MP_CHAT_HISTORY_SIZE) {
@@ -1562,8 +1561,7 @@ static void handle_chat_from_host(const uint8_t *payload, uint32_t size)
     /* Store in chat history */
     mp_chat_entry *entry = &chat_history.entries[chat_history.write_index];
     entry->sender_id = sender_id;
-    strncpy(entry->message, message, MP_CHAT_MESSAGE_MAX - 1);
-    entry->message[MP_CHAT_MESSAGE_MAX - 1] = '\0';
+    copy_text(entry->message, sizeof(entry->message), message);
     entry->timestamp_tick = session.authoritative_tick;
     chat_history.write_index = (chat_history.write_index + 1) % MP_CHAT_HISTORY_SIZE;
     if (chat_history.count < MP_CHAT_HISTORY_SIZE) {
@@ -2049,8 +2047,7 @@ int net_session_init(void)
     if (!persistent_name_set) {
         const char *saved_name = config_get_string(CONFIG_STRING_MP_PLAYER_NAME);
         if (saved_name && saved_name[0]) {
-            strncpy(persistent_player_name, saved_name, NET_MAX_PLAYER_NAME - 1);
-            persistent_player_name[NET_MAX_PLAYER_NAME - 1] = '\0';
+            copy_text(persistent_player_name, sizeof(persistent_player_name), saved_name);
         }
         persistent_name_set = 1;
     }
@@ -2098,8 +2095,7 @@ int net_session_host(const char *player_name, uint16_t port)
     session.session_id = generate_session_id();
     session.local_player_id = session_host_uses_player_slot() ? 0 : NET_PLAYER_ID_NONE;
 
-    strncpy(session.local_player_name, player_name, NET_MAX_PLAYER_NAME - 1);
-    session.local_player_name[NET_MAX_PLAYER_NAME - 1] = '\0';
+    copy_text(session.local_player_name, sizeof(session.local_player_name), player_name);
 
     /* Register host in player registry only when the host is also a playable participant. */
     mp_player_registry_init();
@@ -2163,8 +2159,7 @@ int net_session_join(const char *player_name, const char *host_address, uint16_t
     session.state = NET_SESSION_JOINING;
     mp_player_registry_clear();
 
-    strncpy(session.local_player_name, player_name, NET_MAX_PLAYER_NAME - 1);
-    session.local_player_name[NET_MAX_PLAYER_NAME - 1] = '\0';
+    copy_text(session.local_player_name, sizeof(session.local_player_name), player_name);
 
     net_peer_init(&session.host_peer);
     net_peer_set_connected(&session.host_peer, fd, "Host");
@@ -2193,7 +2188,7 @@ int net_session_join(const char *player_name, const char *host_address, uint16_t
     /* Fixed-size name field: zero-padded to NET_MAX_PLAYER_NAME bytes */
     char name_buf[NET_MAX_PLAYER_NAME];
     memset(name_buf, 0, sizeof(name_buf));
-    strncpy(name_buf, player_name, NET_MAX_PLAYER_NAME - 1);
+    copy_text(name_buf, sizeof(name_buf), player_name);
     net_write_raw(&s, name_buf, NET_MAX_PLAYER_NAME);
 
     /* Try to load persisted identity for reconnect (survives app restart).
@@ -2672,8 +2667,7 @@ int net_session_send_chat(const char *message)
         /* Host: store locally and broadcast */
         mp_chat_entry *entry = &chat_history.entries[chat_history.write_index];
         entry->sender_id = session.local_player_id;
-        strncpy(entry->message, message, MP_CHAT_MESSAGE_MAX - 1);
-        entry->message[MP_CHAT_MESSAGE_MAX - 1] = '\0';
+        copy_text(entry->message, sizeof(entry->message), message);
         entry->timestamp_tick = session.authoritative_tick;
         chat_history.write_index = (chat_history.write_index + 1) % MP_CHAT_HISTORY_SIZE;
         if (chat_history.count < MP_CHAT_HISTORY_SIZE) {
@@ -2708,8 +2702,7 @@ void net_session_set_local_name(const char *name)
         return; /* All spaces — reject */
     }
 
-    strncpy(persistent_player_name, start, NET_MAX_PLAYER_NAME - 1);
-    persistent_player_name[NET_MAX_PLAYER_NAME - 1] = '\0';
+    copy_text(persistent_player_name, sizeof(persistent_player_name), start);
 
     /* Trim trailing spaces */
     int len = (int)strlen(persistent_player_name);
@@ -2724,8 +2717,8 @@ void net_session_set_local_name(const char *name)
 
     /* Also update the active session name if one exists */
     if (session.state != NET_SESSION_IDLE) {
-        strncpy(session.local_player_name, persistent_player_name, NET_MAX_PLAYER_NAME - 1);
-        session.local_player_name[NET_MAX_PLAYER_NAME - 1] = '\0';
+        copy_text(session.local_player_name, sizeof(session.local_player_name),
+                  persistent_player_name);
     }
 
     MP_LOG_INFO("SESSION", "Player name set to '%s'", persistent_player_name);

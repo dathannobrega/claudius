@@ -11,6 +11,7 @@
 #include <ctype.h>
 
 static mp_dedicated_server_options options;
+static int shutdown_requested;
 
 static char *trim_banlist_text(char *text)
 {
@@ -49,6 +50,7 @@ static int ascii_case_equals(const char *a, const char *b)
 void mp_dedicated_server_reset_options(void)
 {
     memset(&options, 0, sizeof(options));
+    shutdown_requested = 0;
     options.port = NET_DEFAULT_PORT;
     options.max_players = 8;
     options.dynamic_city_pool = 8;
@@ -186,6 +188,18 @@ int mp_dedicated_server_is_banned(const uint8_t *player_uuid, const char *remote
 
     fclose(fp);
     return 0;
+}
+
+void mp_dedicated_server_request_shutdown(void)
+{
+    shutdown_requested = 1;
+}
+
+int mp_dedicated_server_consume_shutdown_request(void)
+{
+    int requested = shutdown_requested;
+    shutdown_requested = 0;
+    return requested;
 }
 
 #endif /* ENABLE_MULTIPLAYER */

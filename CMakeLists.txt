@@ -871,6 +871,9 @@ if(BUILD_DEDICATED_SERVER AND ENABLE_MULTIPLAYER AND UNIX AND NOT APPLE)
         ${PROJECT_SOURCE_DIR}/src/platform/claudius.c
         ${PROJECT_SOURCE_DIR}/res/claudius.rc
     )
+    list(APPEND DEDICATED_SERVER_SOURCES
+        ${PROJECT_SOURCE_DIR}/src/platform/dedicated_system.c
+    )
     add_executable(claudius_server ${DEDICATED_SERVER_SOURCES}
         ${PROJECT_SOURCE_DIR}/src/platform/dedicated_server_main.c)
     set_target_properties(claudius_server PROPERTIES OUTPUT_NAME "claudius-server")

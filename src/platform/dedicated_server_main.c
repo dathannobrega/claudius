@@ -486,6 +486,10 @@ int main(int argc, char **argv)
         int millis_per_tick;
 
         last_loop_ms = now_ms;
+        if (mp_dedicated_server_consume_shutdown_request()) {
+            server_shutdown_requested = 1;
+            break;
+        }
         time_set_millis(now_ms);
         multiplayer_runtime_update();
 
