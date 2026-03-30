@@ -5,6 +5,7 @@
 #include "core/config.h"
 #include "core/direction.h"
 #include "editor/editor.h"
+#include "game/game.h"
 #include "graphics/menu.h"
 #include "graphics/renderer.h"
 #include "map/grid.h"
@@ -44,6 +45,30 @@ static struct {
 } data;
 
 static int view_to_grid_offset_lookup[VIEW_X_MAX][VIEW_Y_MAX];
+
+static void ensure_headless_viewport_defaults(void)
+{
+    if (!game_is_headless_server()) {
+        return;
+    }
+    if (data.screen_width > 0 && data.screen_height > 0 &&
+        data.viewport.width_pixels > 0 && data.viewport.height_pixels > 0) {
+        return;
+    }
+
+    /*
+     * Dedicated server never renders, but city view math still needs a sane,
+     * non-zero viewport to initialize routing/minimap bookkeeping safely.
+     */
+    data.screen_width = (map_grid_width() + 4) * TILE_WIDTH_PIXELS + 160;
+    data.screen_height = (map_grid_height() * 2 + 4) * HALF_TILE_HEIGHT_PIXELS + TOP_MENU_HEIGHT;
+    if (data.screen_width < 800) {
+        data.screen_width = 800;
+    }
+    if (data.screen_height < 600) {
+        data.screen_height = 600;
+    }
+}
 
 static void check_camera_boundaries(void)
 {
@@ -218,6 +243,7 @@ static void adjust_camera_position_for_pixels(void)
 void city_view_init(void)
 {
     calculate_lookup();
+    ensure_headless_viewport_defaults();
     city_view_set_scale(100);
     widget_minimap_invalidate();
 }
@@ -240,6 +266,10 @@ int city_view_get_scale(void)
 
 int city_view_get_max_scale(void)
 {
+    if (data.viewport.width_pixels <= 0 || data.viewport.height_pixels <= 0) {
+        return 100;
+    }
+
     int max_x_pixels = (map_grid_width() + 4) * TILE_WIDTH_PIXELS;
     int max_y_pixels = (map_grid_height() * 2 + 4) * HALF_TILE_HEIGHT_PIXELS;
 
@@ -602,6 +632,7 @@ static void set_viewport_without_sidebar(void)
 
 void city_view_set_scale(int scale)
 {
+    ensure_headless_viewport_defaults();
     scale = calc_bound(scale, 50, city_view_get_max_scale());
     data.scale = scale;
     if (data.sidebar_collapsed) {
@@ -610,13 +641,16 @@ void city_view_set_scale(int scale)
         set_viewport_with_sidebar();
     }
     check_camera_boundaries();
-    graphics_renderer()->update_scale(scale);
+    if (graphics_renderer() && graphics_renderer()->update_scale) {
+        graphics_renderer()->update_scale(scale);
+    }
 }
 
 void city_view_set_viewport(int screen_width, int screen_height)
 {
     data.screen_width = screen_width;
     data.screen_height = screen_height;
+    ensure_headless_viewport_defaults();
     if (data.sidebar_collapsed) {
         set_viewport_without_sidebar();
     } else {

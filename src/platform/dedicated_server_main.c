@@ -27,6 +27,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__linux__)
+#include <execinfo.h>
+#include <unistd.h>
+#endif
+
 #define SERVER_STATUS_INTERVAL_MS 1000u
 #define SERVER_DEFAULT_CONFIG     "claudius-server.ini"
 
@@ -38,8 +43,27 @@ typedef struct {
 static volatile sig_atomic_t server_shutdown_requested;
 static volatile sig_atomic_t server_reload_requested;
 
+#if defined(__linux__)
+static void print_crash_backtrace(int sig)
+{
+    void *frames[64];
+    int frame_count = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
+
+    fprintf(stderr, "\nFATAL: claudius-server received signal %d\n", sig);
+    if (frame_count > 0) {
+        backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
+    }
+}
+#endif
+
 static void handle_signal(int sig)
 {
+#if defined(__linux__)
+    if (sig == SIGSEGV || sig == SIGABRT || sig == SIGBUS || sig == SIGILL) {
+        print_crash_backtrace(sig);
+        _exit(128 + sig);
+    }
+#endif
     if (sig == SIGINT || sig == SIGTERM) {
         server_shutdown_requested = 1;
     }
@@ -479,6 +503,12 @@ int main(int argc, char **argv)
     signal(SIGTERM, handle_signal);
 #ifndef _WIN32
     signal(SIGHUP, handle_signal);
+#endif
+#if defined(__linux__)
+    signal(SIGSEGV, handle_signal);
+    signal(SIGABRT, handle_signal);
+    signal(SIGBUS, handle_signal);
+    signal(SIGILL, handle_signal);
 #endif
 
     if (!start_dedicated_session()) {
