@@ -2,6 +2,9 @@
 
 #ifdef ENABLE_MULTIPLAYER
 
+#include "checksum.h"
+#include "ownership.h"
+#include "player_registry.h"
 #include "snapshot.h"
 #include "time_sync.h"
 #include "network/session.h"
@@ -62,6 +65,8 @@ void multiplayer_resync_handle_request(uint8_t player_id)
             if (sess->peers[i].active && sess->peers[i].player_id == player_id) {
                 net_session_send_to_peer(i, NET_MSG_RESYNC_GRANTED,
                                         snapshot_buffer, snapshot_size);
+                mp_checksum_grant_resync_grace(player_id,
+                                               net_session_get_authoritative_tick());
                 break;
             }
         }
@@ -75,6 +80,9 @@ void multiplayer_resync_apply_full_snapshot(const uint8_t *data, uint32_t size)
     log_info("Applying resync snapshot", 0, (int)size);
 
     if (mp_snapshot_apply_full(data, size)) {
+        mp_player_registry_mark_local_player(net_session_get_local_player_id());
+        mp_ownership_reapply_city_owners();
+        mp_checksum_init();
         resync_data.in_progress = 0;
         mp_time_sync_set_join_barrier(0);
         log_info("Resync completed successfully", 0, 0);

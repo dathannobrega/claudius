@@ -5,7 +5,7 @@
 
 #include <stdint.h>
 
-#define NET_PROTOCOL_VERSION        9
+#define NET_PROTOCOL_VERSION        10
 #define NET_MAX_PAYLOAD_SIZE        65536
 #define NET_MAX_PLAYER_NAME         32
 #define NET_MAX_PLAYERS             8

@@ -212,6 +212,7 @@ void multiplayer_snapshot_receive_full(const uint8_t *data, uint32_t size)
 {
     if (mp_snapshot_apply_full(data, size)) {
         mp_player_registry_mark_local_player(net_session_get_local_player_id());
+        mp_ownership_reapply_city_owners();
     }
 }
 
@@ -219,6 +220,7 @@ void multiplayer_snapshot_receive_delta(const uint8_t *data, uint32_t size)
 {
     if (mp_snapshot_apply_delta(data, size)) {
         mp_player_registry_mark_local_player(net_session_get_local_player_id());
+        mp_ownership_reapply_city_owners();
     }
 }
 

@@ -124,6 +124,7 @@ void mp_time_sync_serialize(uint8_t *buffer, uint32_t *size)
     net_write_i32(&s, game_time_month());
     net_write_i32(&s, game_time_day());
     net_write_i32(&s, game_time_tick());
+    net_write_i32(&s, game_time_total_days());
 
     *size = (uint32_t)net_serializer_position(&s);
 }
@@ -138,15 +139,17 @@ void mp_time_sync_deserialize(const uint8_t *buffer, uint32_t size)
     time_data.paused = net_read_u8(&s);
     time_data.speed = net_read_u8(&s);
 
-    /* Read game time but don't apply - game time is managed by tick.c */
     int year = net_read_i32(&s);
     int month = net_read_i32(&s);
     int day = net_read_i32(&s);
     int tick = net_read_i32(&s);
-    (void)year;
-    (void)month;
-    (void)day;
-    (void)tick;
+    int total_days = 0;
+
+    if (net_serializer_remaining(&s) >= (int)sizeof(int32_t)) {
+        total_days = net_read_i32(&s);
+    }
+
+    game_time_set_state(tick, day, month, year, total_days);
 }
 
 void mp_time_sync_set_join_barrier(int active)

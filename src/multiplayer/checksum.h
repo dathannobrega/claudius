@@ -39,6 +39,7 @@ void multiplayer_checksum_handle_request(const uint8_t *data, uint32_t size);
  * Check if should request checksums this tick.
  */
 int mp_checksum_should_check(uint32_t current_tick);
+void mp_checksum_grant_resync_grace(uint8_t player_id, uint32_t current_tick);
 
 /**
  * Get desync info for UI.

@@ -26,6 +26,7 @@ static struct {
     int has_desync;
     uint8_t desynced_player;
     uint8_t mismatch_counts[MP_MAX_PLAYERS];
+    uint32_t resync_grace_until_tick[MP_MAX_PLAYERS];
 } checksum_data;
 
 void mp_checksum_init(void)
@@ -162,6 +163,15 @@ void multiplayer_checksum_receive_response(uint8_t player_id,
         }
     }
 
+    if (checksum_data.resync_grace_until_tick[player_id] > 0 &&
+        tick <= checksum_data.resync_grace_until_tick[player_id]) {
+        if (client_checksum == checksum_data.host_checksum) {
+            checksum_data.mismatch_counts[player_id] = 0;
+            checksum_data.resync_grace_until_tick[player_id] = 0;
+        }
+        return;
+    }
+
     if (client_checksum != checksum_data.host_checksum) {
         if (checksum_data.mismatch_counts[player_id] < 255) {
             checksum_data.mismatch_counts[player_id]++;
@@ -176,10 +186,15 @@ void multiplayer_checksum_receive_response(uint8_t player_id,
         checksum_data.has_desync = 1;
         checksum_data.desynced_player = player_id;
         log_error("DESYNC confirmed for player", 0, player_id);
-        log_error("Host checksum vs client", 0,
-                  (int)(checksum_data.host_checksum ^ client_checksum));
+        MP_LOG_ERROR("CHECKSUM",
+                     "DESYNC confirmed for player %d: host=0x%08x client=0x%08x tick=%u",
+                     (int)player_id,
+                     checksum_data.host_checksum,
+                     client_checksum,
+                     tick);
     } else {
         checksum_data.mismatch_counts[player_id] = 0;
+        checksum_data.resync_grace_until_tick[player_id] = 0;
         if (checksum_data.desynced_player == player_id) {
             checksum_data.has_desync = 0;
             checksum_data.desynced_player = 0;
@@ -221,6 +236,22 @@ int mp_checksum_should_check(uint32_t current_tick)
 
     return (current_tick > 0) &&
            (current_tick - checksum_data.last_check_tick >= NET_CHECKSUM_INTERVAL_TICKS);
+}
+
+void mp_checksum_grant_resync_grace(uint8_t player_id, uint32_t current_tick)
+{
+    if (player_id >= MP_MAX_PLAYERS) {
+        return;
+    }
+
+    checksum_data.mismatch_counts[player_id] = 0;
+    checksum_data.resync_grace_until_tick[player_id] =
+        current_tick + NET_CHECKSUM_INTERVAL_TICKS;
+
+    if (checksum_data.desynced_player == player_id) {
+        checksum_data.has_desync = 0;
+        checksum_data.desynced_player = 0;
+    }
 }
 
 int mp_checksum_has_desync(void)

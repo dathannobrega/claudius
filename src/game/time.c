@@ -82,6 +82,32 @@ int game_time_total_years(void)
     return game_time_total_months() / GAME_TIME_MONTHS_PER_YEAR;
 }
 
+int game_time_total_days(void)
+{
+    return data.total_days;
+}
+
+void game_time_set_state(int tick, int day, int month, int year, int total_days)
+{
+    data.tick = tick >= 0 ? tick : 0;
+    if (data.tick >= GAME_TIME_TICKS_PER_DAY) {
+        data.tick %= GAME_TIME_TICKS_PER_DAY;
+    }
+
+    data.day = day >= 0 ? day : 0;
+    if (data.day >= GAME_TIME_DAYS_PER_MONTH) {
+        data.day %= GAME_TIME_DAYS_PER_MONTH;
+    }
+
+    data.month = month >= 0 ? month : 0;
+    if (data.month >= GAME_TIME_MONTHS_PER_YEAR) {
+        data.month %= GAME_TIME_MONTHS_PER_YEAR;
+    }
+
+    data.year = year;
+    data.total_days = total_days >= 0 ? total_days : 0;
+}
+
 void game_time_save_state(buffer *buf)
 {
     buffer_write_i32(buf, data.tick);

@@ -1589,6 +1589,8 @@ static void handle_client_message(net_peer *peer, const net_packet_header *heade
 
                 peer->state = PEER_STATE_IN_GAME;
                 mp_player_registry_set_status(peer->player_id, MP_PLAYER_IN_GAME);
+                mp_checksum_grant_resync_grace(peer->player_id,
+                                               session.authoritative_tick);
 
                 /* Commit the join transaction */
                 mp_join_transaction *txn = mp_join_transaction_find_by_peer(
