@@ -40,6 +40,9 @@ typedef struct {
     int ai_distance;       /* Distance to nearest AI trade city */
 } spawn_candidate;
 
+static int collect_procedural_candidates(spawn_candidate *candidates, int max_candidates,
+                                         const int *ai_xs, const int *ai_ys, int ai_count);
+
 /* ---- Deterministic PRNG seeded from session_seed ---- */
 
 static uint32_t prng_state;
