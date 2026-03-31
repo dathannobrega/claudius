@@ -3,6 +3,7 @@
 #ifdef ENABLE_MULTIPLAYER
 
 #include "empire_sync.h"
+#include "mp_debug_log.h"
 #include "mp_trade_route.h"
 #include "ownership.h"
 #include "player_registry.h"
